@@ -1,0 +1,19 @@
+{
+  "name": "clean-my-mac",
+  "private": true,
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.20.0",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --filter @clean-my-mac/desktop dev",
+    "build": "pnpm -r build",
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "desktop": "pnpm --filter @clean-my-mac/desktop tauri dev",
+    "desktop:build": "pnpm --filter @clean-my-mac/desktop tauri build",
+    "desktop:app": "sh scripts/build-app.sh",
+    "check:rust": "cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings"
+  }
+}

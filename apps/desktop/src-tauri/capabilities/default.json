@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Core window permissions for Clean My Mac",
+  "windows": ["main"],
+  "permissions": ["core:default"]
+}
