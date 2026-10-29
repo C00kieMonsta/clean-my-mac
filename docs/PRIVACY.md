@@ -20,7 +20,7 @@ Agent session data can contain prompts, tool output, or source code. The app sho
 
 A scan does not alter files. The user selects cleanable entries and confirms before cleanup. Clean My Mac asks macOS to move those entries to Trash. It does not permanently unlink files or use administrator access. A file that is still active, has changed since the scan, sits outside an approved directory, or cannot safely be moved is skipped and shown as a failure.
 
-Each scan is limited to 12 seconds, 100,000 visited entries, and 5,000 findings. Agent scans use part of this budget so other categories can still be checked. It skips symbolic links, reports unreadable locations as warnings, and may return partial results when it reaches a limit. System locations, application bundles, personal libraries, and agent credentials are outside its cleanup allowlist.
+Each scan is limited to 12 seconds and 5,000 findings. Agent traversal has separate limits of 5 seconds, 30,000 visited entries, and 1,500 findings. Other categories can visit up to 100,000 entries within the remaining time. It skips symbolic links, reports unreadable locations as warnings, and may return partial results when it reaches a limit. System locations, application bundles, personal libraries, and agent credentials are outside its cleanup allowlist.
 
 ## Restoring items
 

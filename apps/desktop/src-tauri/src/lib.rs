@@ -46,6 +46,7 @@ struct Item {
     source: String,
     risk: String,
     cleanable: bool,
+    requires_ack: bool,
     reason: Option<String>,
 }
 
@@ -87,6 +88,7 @@ struct Snapshot {
     path: PathBuf,
     policy: Policy,
     cleanable: bool,
+    requires_ack: bool,
     guard_hint: String,
     fingerprint: Fingerprint,
 }
@@ -497,40 +499,38 @@ fn push_candidate(
     let age = now_secs().saturating_sub(fp.modified_secs);
     let process_reason = active_process_reason(policy, active_agents, &description);
     let guard_hint = description.clone();
-    let (cleanable, risk, reason) = if let Some(reason) = process_reason {
-        (false, "protected", Some(reason))
-    } else {
-        match policy {
-            Policy::Cache if is_old_enough(policy, age) => (true, "safe", None),
-            Policy::Cache => (
-                false,
-                "review",
-                Some("Used within the last 7 days. Wait before clearing it."),
-            ),
-            Policy::Session if is_old_enough(policy, age) => (
-                true,
-                "review",
-                Some(
-                    "Old agent history may contain prompts and file paths. Review it before clearing.",
-                ),
-            ),
-            Policy::Session => (
-                false,
-                "review",
-                Some("Session history must be at least 30 days old."),
-            ),
-            Policy::Developer if is_old_enough(policy, age) => (true, "review", None),
-            Policy::Developer => (
-                false,
-                "review",
-                Some("Used within the last 7 days. Wait before clearing it."),
-            ),
-            Policy::ReadOnly => (
-                false,
-                "protected",
-                Some("Large files are listed for review. Open Finder to remove them."),
-            ),
+    let (cleanable, requires_ack, risk, reason) = match policy {
+        Policy::Cache if process_reason.is_none() && is_old_enough(policy, age) => {
+            (true, false, "safe", None)
         }
+        Policy::Cache => (
+            true,
+            true,
+            "review",
+            Some(process_reason.unwrap_or("Used within the last 7 days. Review before clearing.")),
+        ),
+        Policy::Session => (
+            true,
+            true,
+            "review",
+            Some(process_reason.unwrap_or(if is_old_enough(policy, age) {
+                "Session history may contain prompts and file paths. Review before clearing."
+            } else {
+                "Recent session history may contain prompts and file paths. Review before clearing."
+            })),
+        ),
+        Policy::Developer => (
+            true,
+            true,
+            "review",
+            Some(process_reason.unwrap_or("Build files can belong to recent or active work. Review before clearing.")),
+        ),
+        Policy::ReadOnly => (
+            true,
+            true,
+            "review",
+            Some("This is a file in Downloads. Review it before moving it to Trash."),
+        ),
     };
     let id = format!("item-{}", items.len());
     let item = Item {
@@ -545,6 +545,7 @@ fn push_candidate(
         source,
         risk: risk.into(),
         cleanable,
+        requires_ack,
         reason: reason.map(str::to_string),
     };
     snapshots.insert(
@@ -553,6 +554,7 @@ fn push_candidate(
             path,
             policy,
             cleanable,
+            requires_ack,
             guard_hint,
             fingerprint: fp,
         },
@@ -892,7 +894,10 @@ fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
                 .iter()
                 .any(|root| path.starts_with(root))
         }
-        Policy::ReadOnly => path.parent().is_some_and(|p| p == home.join("Downloads")),
+        Policy::ReadOnly => {
+            path.parent().is_some_and(|p| p == home.join("Downloads"))
+                && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+        }
     }
 }
 
@@ -971,6 +976,7 @@ fn cleanup_selected(
     home: &Path,
     item_ids: Vec<String>,
     selected: Vec<(String, Snapshot)>,
+    acknowledge_risk: bool,
 ) -> CleanupResult {
     let mut result = CleanupResult {
         trashed_ids: Vec::new(),
@@ -1001,19 +1007,16 @@ fn cleanup_selected(
             });
             continue;
         };
+        let active_reason = active_process_reason(snapshot.policy, &active_processes, &snapshot.guard_hint);
         let failure = if !snapshot.cleanable {
             Some(
                 "This item is protected. Only items marked as cleanable can be moved to Trash."
                     .into(),
             )
-        } else if snapshot.policy == Policy::ReadOnly {
-            Some("Large files are listed for review and cannot be moved by cleanup.".into())
+        } else if (snapshot.requires_ack || active_reason.is_some()) && !acknowledge_risk {
+            Some("Review the selected items and confirm that you want to move them to Trash.".into())
         } else if !policy_allows(&snapshot.path, home, snapshot.policy) {
             Some("This location is protected and cannot be moved to Trash.".into())
-        } else if let Some(reason) =
-            active_process_reason(snapshot.policy, &active_processes, &snapshot.guard_hint)
-        {
-            Some(reason.into())
         } else {
             match fingerprint(&snapshot.path) {
                 Ok(current) if current == snapshot.fingerprint => None,
@@ -1035,7 +1038,7 @@ fn cleanup_selected(
             });
             continue;
         }
-        if let Some(reason) = active_process_reason(
+        if !acknowledge_risk && let Some(reason) = active_process_reason(
             snapshot.policy,
             &running_agent_names(),
             &snapshot.guard_hint,
@@ -1067,6 +1070,7 @@ async fn trash_items(
     state: State<'_, AppState>,
     scan_id: String,
     item_ids: Vec<String>,
+    acknowledge_risk: Option<bool>,
 ) -> Result<CleanupResult, String> {
     let (scan, selected) = {
         let registry = lock_registry(&state);
@@ -1104,8 +1108,10 @@ async fn trash_items(
             }],
         });
     };
-    let result =
-        tauri::async_runtime::spawn_blocking(move || cleanup_selected(&home, item_ids, selected))
+    let acknowledge_risk = acknowledge_risk.unwrap_or(false);
+    let result = tauri::async_runtime::spawn_blocking(move || {
+        cleanup_selected(&home, item_ids, selected, acknowledge_risk)
+    })
             .await
             .map_err(|_| "The cleanup could not finish.".to_string())?;
     Ok(result)

@@ -13,6 +13,7 @@ export interface ScanItem {
   source: string;
   risk: Risk;
   cleanable: boolean;
+  requiresAck?: boolean;
   reason?: string | null;
 }
 
@@ -57,7 +58,7 @@ export const categories: {
   {
     id: "large",
     name: "Large files",
-    description: "Downloads worth a second look",
+    description: "Review large downloads before clearing",
     color: "green",
   },
 ];

@@ -68,6 +68,7 @@ export default function App() {
   const [scanning, setScanning] = useState(false);
   const [cleaning, setCleaning] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [expanded, setExpanded] = useState<Set<Category>>(new Set());
   const [limits, setLimits] = useState<Partial<Record<Category, number>>>({});
   const [filter, setFilter] = useState<Filter>("all");
@@ -84,6 +85,9 @@ export default function App() {
   const eligible = eligibleItems(items);
   const chosen = selectedItems(items, selected);
   const chosenBytes = totalBytes(chosen);
+  const needsRiskAcknowledgement = chosen.some(
+    (item) => item.requiresAck ?? item.risk !== "safe",
+  );
   const recommended = eligible.filter((item) => item.risk === "safe");
   const reclaimable = totalBytes(eligible);
   const usedBytes = report
@@ -120,6 +124,9 @@ export default function App() {
   useEffect(() => {
     void scan();
   }, []);
+  useEffect(() => {
+    if (modal !== "cleanup") setRiskAcknowledged(false);
+  }, [modal]);
 
   function navigate(next: View) {
     setView(next);
@@ -142,6 +149,7 @@ export default function App() {
       else next.add(item.id);
       return next;
     });
+    setRiskAcknowledged(false);
   }
   function toggleGroup(group: ScanItem[]) {
     const selectable = eligibleItems(group);
@@ -166,11 +174,13 @@ export default function App() {
       }
       return next;
     });
+    setRiskAcknowledged(false);
   }
   function selectRecommended() {
     setSelected(
       new Set(recommended.slice(0, MAX_SELECTION).map((item) => item.id)),
     );
+    setRiskAcknowledged(false);
     if (recommended.length > MAX_SELECTION) {
       setNotice({
         text: "Selected the first 200 recommended items. You can clear the rest in another pass.",
@@ -202,6 +212,7 @@ export default function App() {
       const result = await trashItems(
         report.id,
         chosen.map((item) => item.id),
+        needsRiskAcknowledgement && riskAcknowledged,
       );
       const removed = new Set(result.trashedIds);
       setMovedItems(chosen.filter((item) => removed.has(item.id)));
@@ -214,6 +225,7 @@ export default function App() {
           : previous,
       );
       setSelected(new Set());
+      setRiskAcknowledged(false);
       setModal(null);
       setNotice({
         text: `${result.trashedIds.length} item${result.trashedIds.length === 1 ? "" : "s"} moved to Trash (${formatBytes(result.reclaimedBytes)}). Empty Trash in Finder to free disk space.${result.failures.length ? ` ${result.failures.length} item(s) were kept: ${result.failures.map((failure) => failure.message).join(" ")}` : ""}`,
@@ -781,7 +793,10 @@ export default function App() {
             {selected.size > 0 ? (
               <button
                 className="text-button"
-                onClick={() => setSelected(new Set())}
+                onClick={() => {
+                  setSelected(new Set());
+                  setRiskAcknowledged(false);
+                }}
                 disabled={scanning || cleaning}
               >
                 Deselect all
@@ -799,7 +814,10 @@ export default function App() {
             <button
               className="button primary"
               disabled={!chosen.length || scanning || cleaning}
-              onClick={() => setModal("cleanup")}
+                onClick={() => {
+                  setRiskAcknowledged(false);
+                  setModal("cleanup");
+                }}
             >
               Review cleanup
               <ArrowRight size={16} />
@@ -834,9 +852,8 @@ export default function App() {
             <li>
               <strong>Choose what can go</strong>
               <p>
-                Cache candidates must be at least 7 days old. Agent sessions
-                must be at least 30 days old. Active tools and personal
-                downloads are kept for review.
+                Recommendations are conservative. You can also select other
+                eligible files after reviewing their paths and risk notes.
               </p>
             </li>
             <li>
@@ -919,6 +936,21 @@ export default function App() {
             Finder’s Put Back option may be unavailable. Space is freed when you
             empty Trash. Changed or active files will be skipped.
           </p>
+          {needsRiskAcknowledgement && (
+            <label className="risk-acknowledgement">
+              <input
+                type="checkbox"
+                checked={riskAcknowledged}
+                onChange={(event) =>
+                  setRiskAcknowledged(event.currentTarget.checked)
+                }
+              />
+              <span>
+                I understand these files may be in use or contain history I
+                need.
+              </span>
+            </label>
+          )}
           {previewMode && (
             <div className="preview-notice">
               <Info size={16} />
@@ -935,7 +967,11 @@ export default function App() {
             </button>
             <button
               className="button primary"
-              disabled={cleaning || previewMode}
+              disabled={
+                cleaning ||
+                previewMode ||
+                (needsRiskAcknowledgement && !riskAcknowledged)
+              }
               onClick={() => void cleanup()}
             >
               {cleaning ? (

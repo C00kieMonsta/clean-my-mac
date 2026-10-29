@@ -12,12 +12,17 @@ export async function scanSystem(): Promise<ScanReport> {
 export async function trashItems(
   scanId: string,
   itemIds: string[],
+  acknowledgeRisk = false,
 ): Promise<CleanupResult> {
   if (previewMode)
     throw new Error(
       "Open the Mac app to move files to Trash. This preview uses sample data.",
     );
-  return invoke<CleanupResult>("trash_items", { scanId, itemIds });
+  return invoke<CleanupResult>("trash_items", {
+    scanId,
+    itemIds,
+    acknowledgeRisk,
+  });
 }
 
 export async function revealItem(
