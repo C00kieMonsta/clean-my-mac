@@ -154,7 +154,7 @@ export default function App() {
         MAX_SELECTION
     ) {
       setNotice({
-        text: "Selected the first 200 items. You can clear the rest in another pass.",
+        text: "Selection is limited to 200 items. Clear this batch before selecting more.",
         error: false,
       });
     }
@@ -656,18 +656,19 @@ export default function App() {
                                     <div className="file-name">
                                       {item.name}
                                       <span className={`risk-tag ${item.risk}`}>
-                                        {item.risk === "protected" ? (
+                                        {item.category === "large" &&
+                                        !item.cleanable ? (
+                                          "Finder only"
+                                        ) : item.risk === "protected" ||
+                                          !item.cleanable ? (
                                           <>
                                             <LockKeyhole size={10} />
                                             Kept
                                           </>
-                                        ) : item.cleanable &&
-                                          item.risk === "safe" ? (
+                                        ) : item.risk === "safe" ? (
                                           "Recommended"
-                                        ) : item.cleanable ? (
-                                          "Review first"
                                         ) : (
-                                          "Finder only"
+                                          "Review first"
                                         )}
                                       </span>
                                     </div>

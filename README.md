@@ -28,3 +28,7 @@ Clean My Mac does not request administrator access, use `sudo`, or erase files d
 ## Downloading
 
 The manual GitHub Actions workflow builds Apple silicon and Intel DMG files and attaches them to the workflow run. An ad-hoc signed build is for local testing and is not ready for public download. Public distribution requires an Apple Developer ID signature and notarization. Once Apple signing credentials are configured in GitHub Actions, select the signed and notarized option in the workflow.
+
+## Development preview
+
+Run `pnpm dev` for a browser preview with labeled sample data. Browser preview cannot read or change files. The native app reads real filesystem metadata. With the preview running, `pnpm --filter @clean-my-mac/desktop exec node qa/smoke.mjs` checks the review flow, protected files, search, and minimum window size.

@@ -22,6 +22,15 @@ pnpm desktop:app
 
 `pnpm desktop:app` builds an ad-hoc signed local app bundle and opens it. To create a DMG, run `pnpm desktop:build --bundles dmg`. Set `APPLE_SIGNING_IDENTITY` when building with an installed Developer ID Application certificate.
 
+To build one local installer for Apple silicon and Intel Macs:
+
+```sh
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+APPLE_SIGNING_IDENTITY=- pnpm desktop:build --target universal-apple-darwin --bundles app,dmg
+```
+
+This creates a test installer under `apps/desktop/src-tauri/target/universal-apple-darwin/release/bundle/dmg`. Replace the ad-hoc identity and configure notarization before public distribution.
+
 ## CI artifacts
 
 The **Build macOS downloads** GitHub Actions workflow has a manual trigger. It builds one DMG on an Apple silicon runner and another on an Intel runner. It runs the frontend build, type check, and test suite first. The workflow only attaches the two DMGs to its run as artifacts. It does not make a GitHub Release or publish a download page.

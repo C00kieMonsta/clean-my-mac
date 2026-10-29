@@ -249,10 +249,22 @@ describe("Clean My Mac cleanup review", () => {
     expect(
       screen.getByRole("checkbox", { name: "Select Old agent conversation" }),
     ).toBeInTheDocument();
-    fireEvent.click(screen.getByRole("button", { name: "View moved files and original locations" }));
-    const receipt = await screen.findByRole("dialog", { name: "Your last cleanup" });
-    expect(within(receipt).getByRole("textbox", { name: "Original location of Browser cache" })).toHaveValue("~/Library/Caches/Browser");
-    expect(within(receipt).queryByText("Old agent conversation")).not.toBeInTheDocument();
+    fireEvent.click(
+      screen.getByRole("button", {
+        name: "View moved files and original locations",
+      }),
+    );
+    const receipt = await screen.findByRole("dialog", {
+      name: "Your last cleanup",
+    });
+    expect(
+      within(receipt).getByRole("textbox", {
+        name: "Original location of Browser cache",
+      }),
+    ).toHaveValue("~/Library/Caches/Browser");
+    expect(
+      within(receipt).queryByText("Old agent conversation"),
+    ).not.toBeInTheDocument();
   });
 
   it("searches the selected category by file name", async () => {

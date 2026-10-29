@@ -4,6 +4,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, Metadata},
     hash::{DefaultHasher, Hash, Hasher},
+    io::ErrorKind,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -17,6 +18,10 @@ const SESSION_MIN_AGE: u64 = 30 * DAY;
 const LARGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCAN_SECONDS: u64 = 12;
 const MAX_VISITED: usize = 100_000;
+const MAX_SCAN_ITEMS: usize = 5_000;
+const MAX_AGENT_ITEMS: usize = 1_500;
+const MAX_AGENT_VISITED: usize = 30_000;
+const MAX_AGENT_SCAN_SECONDS: u64 = 5;
 const MAX_TRASH_SELECTION: usize = 200;
 
 #[derive(Clone, Serialize)]
@@ -82,6 +87,7 @@ struct Snapshot {
     path: PathBuf,
     policy: Policy,
     cleanable: bool,
+    guard_hint: String,
     fingerprint: Fingerprint,
 }
 
@@ -160,7 +166,13 @@ fn metadata_digest(path: &Path, meta: &Metadata) -> u64 {
     hasher.finish()
 }
 
-fn measure_tree(path: &Path, started: Instant, budget: &mut usize) -> Result<Fingerprint, String> {
+fn measure_tree(
+    path: &Path,
+    started: Instant,
+    budget: &mut usize,
+    max_seconds: u64,
+    max_entries: usize,
+) -> Result<Fingerprint, String> {
     let root_meta =
         fs::symlink_metadata(path).map_err(|e| format!("Item is no longer available: {e}"))?;
     if root_meta.file_type().is_symlink() {
@@ -187,7 +199,7 @@ fn measure_tree(path: &Path, started: Instant, budget: &mut usize) -> Result<Fin
     let mut count = 0_u64;
     let mut newest = modified_secs(&root_meta);
     while let Some(dir) = stack.pop() {
-        if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS) || *budget >= MAX_VISITED {
+        if started.elapsed() > Duration::from_secs(max_seconds) || *budget >= max_entries {
             return Err(
                 "The scan reached its safety limit. Run a new scan before cleaning this item."
                     .into(),
@@ -195,7 +207,7 @@ fn measure_tree(path: &Path, started: Instant, budget: &mut usize) -> Result<Fin
         }
         let entries = fs::read_dir(&dir).map_err(|e| format!("Could not verify the item: {e}"))?;
         for entry in entries {
-            if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS) || *budget >= MAX_VISITED {
+            if started.elapsed() > Duration::from_secs(max_seconds) || *budget >= max_entries {
                 return Err(
                     "The scan reached its safety limit. Run a new scan before cleaning this item."
                         .into(),
@@ -230,11 +242,17 @@ fn measure_tree(path: &Path, started: Instant, budget: &mut usize) -> Result<Fin
 }
 
 fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
-    measure_tree(path, Instant::now(), &mut 0)
+    measure_tree(path, Instant::now(), &mut 0, MAX_SCAN_SECONDS, MAX_VISITED)
 }
 
-fn inspect_tree(path: &Path, started: Instant, budget: &mut usize) -> Result<Fingerprint, String> {
-    measure_tree(path, started, budget)
+fn inspect_tree(
+    path: &Path,
+    started: Instant,
+    budget: &mut usize,
+    max_seconds: u64,
+    max_entries: usize,
+) -> Result<Fingerprint, String> {
+    measure_tree(path, started, budget, max_seconds, max_entries)
 }
 
 fn no_symlink_path(path: &Path, home: &Path) -> bool {
@@ -272,7 +290,6 @@ fn cache_roots(home: &Path) -> Vec<(PathBuf, String)> {
     let mut roots: Vec<_> = recognized
         .into_iter()
         .map(|(name, desc)| (caches.join(name), desc.to_string()))
-        .filter(|(path, _)| path.exists())
         .collect();
     roots.push((home.join(".npm/_cacache"), "npm package cache".into()));
     roots.push((
@@ -283,7 +300,6 @@ fn cache_roots(home: &Path) -> Vec<(PathBuf, String)> {
         home.join("Library/Logs/DiagnosticReports"),
         "Old app crash reports".into(),
     ));
-    roots.retain(|(path, _)| path.exists());
     roots
 }
 
@@ -294,13 +310,19 @@ fn cache_candidates(
     warnings: &mut Vec<String>,
 ) -> Vec<(PathBuf, String)> {
     let mut out = Vec::new();
+    let limit = "The scan reached its safety limit. Some items may be missing.";
     for (root, description) in cache_roots(home) {
+        if !no_symlink_path(&root, home) {
+            continue;
+        }
         for entry in read_entries(
             &root,
             started,
             budget,
             warnings,
-            "The scan reached its safety limit. Some items may be missing.",
+            limit,
+            MAX_SCAN_SECONDS,
+            MAX_VISITED,
         ) {
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else {
@@ -313,13 +335,22 @@ fn cache_candidates(
             if meta.file_type().is_symlink() {
                 continue;
             }
-            if path.file_name().is_some_and(|name| name == "_cacache") && meta.is_dir() {
+            let is_cacache =
+                path.file_name().is_some_and(|name| name == "_cacache") && meta.is_dir();
+            let is_content = path.file_name().is_some_and(|name| name == "content-v2")
+                && path.parent().is_some_and(|parent| {
+                    parent.file_name().is_some_and(|name| name == "_cacache")
+                })
+                && meta.is_dir();
+            if is_cacache || is_content {
                 for child in read_entries(
                     &path,
                     started,
                     budget,
                     warnings,
-                    "The scan reached its safety limit. Some items may be missing.",
+                    limit,
+                    MAX_SCAN_SECONDS,
+                    MAX_VISITED,
                 ) {
                     let child_path = child.path();
                     let Ok(child_meta) = fs::symlink_metadata(&child_path) else {
@@ -328,19 +359,28 @@ fn cache_candidates(
                     if child_meta.file_type().is_symlink() {
                         continue;
                     }
-                    if child_path
+                    let is_content = child_path
                         .file_name()
                         .is_some_and(|name| name == "content-v2")
-                        && child_meta.is_dir()
-                    {
+                        && child_path.parent().is_some_and(|parent| {
+                            parent.file_name().is_some_and(|name| name == "_cacache")
+                        })
+                        && child_meta.is_dir();
+                    if is_content {
                         for shard in read_entries(
                             &child_path,
                             started,
                             budget,
                             warnings,
-                            "The scan reached its safety limit. Some items may be missing.",
+                            limit,
+                            MAX_SCAN_SECONDS,
+                            MAX_VISITED,
                         ) {
-                            out.push((shard.path(), format!("{description} content shard")));
+                            if let Ok(shard_meta) = fs::symlink_metadata(shard.path())
+                                && !shard_meta.file_type().is_symlink()
+                            {
+                                out.push((shard.path(), format!("{description} content shard")));
+                            }
                         }
                     } else {
                         out.push((child_path, description.clone()));
@@ -372,6 +412,11 @@ fn running_agent_names() -> Vec<String> {
         "pnpm",
         "yarn",
         "brew",
+        "python",
+        "playwright",
+        "cypress",
+        "pip",
+        "uv",
     ];
     system
         .processes()
@@ -395,7 +440,7 @@ fn volume_info(home: &Path) -> Result<Volume, String> {
     }
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
-    let block = stats.f_frsize as u64;
+    let block = stats.f_frsize;
     Ok(Volume {
         name: "Macintosh HD".into(),
         total_bytes: block.saturating_mul(stats.f_blocks as u64),
@@ -403,6 +448,8 @@ fn volume_info(home: &Path) -> Result<Volume, String> {
     })
 }
 
+// Keep policy evaluation and registration together with the shared scan buffers.
+#[allow(clippy::too_many_arguments)]
 fn push_candidate(
     category: &str,
     policy: Policy,
@@ -416,6 +463,13 @@ fn push_candidate(
     snapshots: &mut HashMap<String, Snapshot>,
     warnings: &mut Vec<String>,
 ) {
+    if items.len() >= MAX_SCAN_ITEMS {
+        note_scan_warning(
+            warnings,
+            "The scan reached its item limit. Some items may be missing.",
+        );
+        return;
+    }
     let name = path
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -426,7 +480,12 @@ fn push_candidate(
     if meta.file_type().is_symlink() {
         return;
     }
-    let fp = match inspect_tree(&path, started, budget) {
+    let (max_seconds, max_entries) = if policy == Policy::Session {
+        (MAX_AGENT_SCAN_SECONDS, MAX_AGENT_VISITED)
+    } else {
+        (MAX_SCAN_SECONDS, MAX_VISITED)
+    };
+    let fp = match inspect_tree(&path, started, budget, max_seconds, max_entries) {
         Ok(fp) => fp,
         Err(message) => {
             if !warnings.contains(&message) {
@@ -436,7 +495,8 @@ fn push_candidate(
         }
     };
     let age = now_secs().saturating_sub(fp.modified_secs);
-    let process_reason = active_process_reason(policy, active_agents);
+    let process_reason = active_process_reason(policy, active_agents, &description);
+    let guard_hint = description.clone();
     let (cleanable, risk, reason) = if let Some(reason) = process_reason {
         (false, "protected", Some(reason))
     } else {
@@ -493,6 +553,7 @@ fn push_candidate(
             path,
             policy,
             cleanable,
+            guard_hint,
             fingerprint: fp,
         },
     );
@@ -505,13 +566,15 @@ fn note_scan_warning(warnings: &mut Vec<String>, message: &str) {
     }
 }
 
-fn budget_one(
+fn budget_one_for(
     started: Instant,
     budget: &mut usize,
     warnings: &mut Vec<String>,
     label: &str,
+    max_seconds: u64,
+    max_entries: usize,
 ) -> bool {
-    if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS) || *budget >= MAX_VISITED {
+    if started.elapsed() > Duration::from_secs(max_seconds) || *budget >= max_entries {
         note_scan_warning(warnings, label);
         return false;
     }
@@ -525,17 +588,30 @@ fn read_entries(
     budget: &mut usize,
     warnings: &mut Vec<String>,
     limit_warning: &str,
+    max_seconds: u64,
+    max_entries: usize,
 ) -> Vec<fs::DirEntry> {
-    let Ok(entries) = fs::read_dir(path) else {
-        note_scan_warning(
-            warnings,
-            "Some folders could not be read. Check macOS privacy permissions.",
-        );
-        return Vec::new();
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Vec::new(),
+        Err(_) => {
+            note_scan_warning(
+                warnings,
+                "Some folders could not be read. Check macOS privacy permissions.",
+            );
+            return Vec::new();
+        }
     };
     let mut found = Vec::new();
     for entry in entries {
-        if !budget_one(started, budget, warnings, limit_warning) {
+        if !budget_one_for(
+            started,
+            budget,
+            warnings,
+            limit_warning,
+            max_seconds,
+            max_entries,
+        ) {
             break;
         }
         match entry {
@@ -557,6 +633,9 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
     let mut warnings = Vec::new();
     let mut budget = 0;
     let limit_warning = "The scan reached its safety limit. Some items may be missing.";
+    let agent_limit_warning =
+        "The agent session scan reached its safety limit. Some sessions may be missing.";
+    let mut agent_budget = 0;
 
     // Agent transcripts are the primary target, so scan them before broad cache folders.
     let session_roots = [
@@ -570,11 +649,29 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
         }
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
-            if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS) || budget >= MAX_VISITED {
-                note_scan_warning(&mut warnings, limit_warning);
+            if started.elapsed() > Duration::from_secs(MAX_AGENT_SCAN_SECONDS)
+                || agent_budget >= MAX_AGENT_VISITED
+                || items.len() >= MAX_AGENT_ITEMS
+            {
+                note_scan_warning(&mut warnings, agent_limit_warning);
                 break;
             }
-            for entry in read_entries(&dir, started, &mut budget, &mut warnings, limit_warning) {
+            for entry in read_entries(
+                &dir,
+                started,
+                &mut agent_budget,
+                &mut warnings,
+                agent_limit_warning,
+                MAX_AGENT_SCAN_SECONDS,
+                MAX_AGENT_VISITED,
+            ) {
+                if started.elapsed() > Duration::from_secs(MAX_AGENT_SCAN_SECONDS)
+                    || agent_budget >= MAX_AGENT_VISITED
+                    || items.len() >= MAX_AGENT_ITEMS
+                {
+                    note_scan_warning(&mut warnings, agent_limit_warning);
+                    break;
+                }
                 let path = entry.path();
                 let Ok(meta) = fs::symlink_metadata(&path) else {
                     note_scan_warning(
@@ -605,7 +702,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                         source.into(),
                         &active_processes,
                         started,
-                        &mut budget,
+                        &mut agent_budget,
                         &mut items,
                         &mut snapshots,
                         &mut warnings,
@@ -623,7 +720,16 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
             &mut budget,
             &mut warnings,
             limit_warning,
+            MAX_SCAN_SECONDS,
+            MAX_VISITED,
         ) {
+            if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
+                || budget >= MAX_VISITED
+                || items.len() >= MAX_SCAN_ITEMS
+            {
+                note_scan_warning(&mut warnings, limit_warning);
+                break;
+            }
             let path = entry.path();
             if no_symlink_path(&path, home) {
                 push_candidate(
@@ -643,9 +749,14 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
         }
     }
 
-    for (path, description) in
-        cache_candidates(home, started, &mut budget, &mut warnings, limit_warning)
-    {
+    for (path, description) in cache_candidates(home, started, &mut budget, &mut warnings) {
+        if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
+            || budget >= MAX_VISITED
+            || items.len() >= MAX_SCAN_ITEMS
+        {
+            note_scan_warning(&mut warnings, limit_warning);
+            break;
+        }
         if no_symlink_path(&path, home) {
             push_candidate(
                 "caches",
@@ -671,7 +782,16 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
             &mut budget,
             &mut warnings,
             limit_warning,
+            MAX_SCAN_SECONDS,
+            MAX_VISITED,
         ) {
+            if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
+                || budget >= MAX_VISITED
+                || items.len() >= MAX_SCAN_ITEMS
+            {
+                note_scan_warning(&mut warnings, limit_warning);
+                break;
+            }
             let path = entry.path();
             let Ok(meta) = fs::symlink_metadata(&path) else {
                 note_scan_warning(
@@ -698,7 +818,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
         }
     }
 
-    if active_process_reason(Policy::Session, &active_processes).is_some() {
+    if active_process_reason(Policy::Session, &active_processes, "").is_some() {
         note_scan_warning(
             &mut warnings,
             "AI coding tools are open. Session transcripts are protected until those apps are closed.",
@@ -740,13 +860,17 @@ fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
             };
             let components = relative.components().count();
             let direct_child = components == 1
+                && relative.file_name().is_some_and(|name| name != "_cacache")
                 && !(root.file_name().is_some_and(|name| name == "_cacache")
                     && relative == Path::new("content-v2"));
             let cacache_index = components == 2
                 && relative
                     .components()
                     .next()
-                    .is_some_and(|part| part.as_os_str() == "_cacache");
+                    .is_some_and(|part| part.as_os_str() == "_cacache")
+                && relative
+                    .file_name()
+                    .is_some_and(|name| name != "content-v2");
             let content_shard = path
                 .parent()
                 .is_some_and(|parent| parent.file_name().is_some_and(|name| name == "content-v2"))
@@ -785,12 +909,13 @@ fn is_old_enough(policy: Policy, age_secs: u64) -> bool {
     }
 }
 
-fn active_process_reason(policy: Policy, active: &[String]) -> Option<&'static str> {
+fn active_process_reason(policy: Policy, active: &[String], hint: &str) -> Option<&'static str> {
     let has = |needles: &[&str]| {
         active
             .iter()
             .any(|name| needles.iter().any(|needle| name.contains(needle)))
     };
+    let hint = hint.to_lowercase();
     match policy {
         Policy::Session
             if has(&[
@@ -802,82 +927,93 @@ fn active_process_reason(policy: Policy, active: &[String]) -> Option<&'static s
         Policy::Developer if has(&["xcode", "xcodebuild", "simulator"]) => {
             Some("Xcode or Simulator is open. Close it before clearing build files.")
         }
-        Policy::Cache if has(&["node", "npm", "pnpm", "yarn", "brew"]) => {
-            Some("A package manager or build process is open. Close it before clearing caches.")
+        Policy::Cache if hint.contains("xcode") && has(&["xcode", "xcodebuild", "simulator"]) => {
+            Some("Xcode or Simulator is open. Close it before clearing its caches.")
+        }
+        Policy::Cache if hint.contains("homebrew") && has(&["brew", "homebrew"]) => {
+            Some("Homebrew is running. Close it before clearing its download cache.")
+        }
+        Policy::Cache
+            if ["npm", "pnpm", "yarn", "playwright", "cypress"]
+                .iter()
+                .any(|name| hint.contains(name))
+                && has(&["node", "npm", "pnpm", "yarn", "playwright", "cypress"]) =>
+        {
+            Some("A package manager or browser build is open. Close it before clearing this cache.")
+        }
+        Policy::Cache
+            if ["python", "pip", "uv"]
+                .iter()
+                .any(|name| hint.contains(name))
+                && has(&["python", "pip", "uv"]) =>
+        {
+            Some("A Python package process is open. Close it before clearing this cache.")
         }
         _ => None,
     }
 }
 
-#[tauri::command(rename_all = "camelCase")]
-async fn trash_items(
-    state: State<'_, AppState>,
-    scan_id: String,
+fn move_to_os_trash(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut context = trash::TrashContext::new();
+        context.set_delete_method(DeleteMethod::NsFileManager);
+        context.delete(path).map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(path).map_err(|e| e.to_string())
+    }
+}
+
+fn cleanup_selected(
+    home: &Path,
     item_ids: Vec<String>,
+    selected: Vec<(String, Snapshot)>,
 ) -> CleanupResult {
-    let state = state.inner().clone();
-    let (scan, selected) = {
-        let registry = lock_registry(&state);
-        (
-            registry.scan_id.clone(),
-            item_ids
-                .iter()
-                .filter_map(|id| registry.entries.get(id).cloned().map(|s| (id.clone(), s)))
-                .collect::<Vec<_>>(),
-        )
-    };
     let mut result = CleanupResult {
         trashed_ids: Vec::new(),
         reclaimed_bytes: 0,
         failures: Vec::new(),
     };
-    if scan_id != scan {
-        result.failures.push(CleanupFailure {
-            id: String::new(),
-            message: "This scan has expired. Scan again before cleaning.".into(),
-        });
-        return result;
+    let mut unique_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for id in item_ids {
+        if seen.insert(id.clone()) {
+            unique_ids.push(id);
+        }
     }
-    if item_ids.is_empty() || item_ids.len() > MAX_TRASH_SELECTION {
+    if unique_ids.is_empty() || unique_ids.len() > MAX_TRASH_SELECTION {
         result.failures.push(CleanupFailure {
             id: String::new(),
             message: "Choose between 1 and 200 items.".into(),
         });
         return result;
     }
-    let home = match home_dir() {
-        Some(path) => path,
-        None => {
-            result.failures.push(CleanupFailure {
-                id: String::new(),
-                message: "Could not find the current user's home folder.".into(),
-            });
-            return result;
-        }
-    };
-    let selected_ids: HashSet<_> = item_ids.iter().cloned().collect();
-    let available_ids: HashSet<_> = selected.iter().map(|(id, _)| id.clone()).collect();
-    for id in selected_ids {
-        if !available_ids.contains(&id) {
+    let selected_by_id: HashMap<_, _> = selected.into_iter().collect();
+    let active_processes = running_agent_names();
+    for id in unique_ids {
+        let Some(snapshot) = selected_by_id.get(&id) else {
             result.failures.push(CleanupFailure {
                 id,
                 message: "This item was not part of the current scan. Scan again.".into(),
             });
-        }
-    }
-    for (id, snapshot) in selected {
-        if !item_ids.contains(&id) {
             continue;
-        }
-        let error = if !snapshot.cleanable {
+        };
+        let failure = if !snapshot.cleanable {
             Some(
                 "This item is protected. Only items marked as cleanable can be moved to Trash."
                     .into(),
             )
-        } else if !policy_allows(&snapshot.path, &home, snapshot.policy) {
+        } else if snapshot.policy == Policy::ReadOnly {
+            Some("Large files are listed for review and cannot be moved by cleanup.".into())
+        } else if !policy_allows(&snapshot.path, home, snapshot.policy) {
             Some("This location is protected and cannot be moved to Trash.".into())
-        } else if snapshot.policy == Policy::Session && !running_agent_names().is_empty() {
-            Some("An AI coding tool is open. Close it before clearing session history.".into())
+        } else if let Some(reason) =
+            active_process_reason(snapshot.policy, &active_processes, &snapshot.guard_hint)
+        {
+            Some(reason.into())
         } else {
             match fingerprint(&snapshot.path) {
                 Ok(current) if current == snapshot.fingerprint => None,
@@ -887,20 +1023,35 @@ async fn trash_items(
                 Err(message) => Some(message),
             }
         };
-        if let Some(message) = error {
+        if let Some(message) = failure {
             result.failures.push(CleanupFailure { id, message });
             continue;
         }
-        let bytes = snapshot.fingerprint.bytes;
-        let path = snapshot.path.clone();
-        let moved = tauri::async_runtime::spawn_blocking(move || trash::delete(path))
-            .await
-            .map_err(|_| "The Trash operation could not finish.".to_string())
-            .and_then(|result| result.map_err(|e| e.to_string()));
-        match moved {
+        // Recheck path safety and active processes after the full snapshot walk, immediately before Trash.
+        if !policy_allows(&snapshot.path, home, snapshot.policy) {
+            result.failures.push(CleanupFailure {
+                id,
+                message: "This location changed during cleanup. Scan again.".into(),
+            });
+            continue;
+        }
+        if let Some(reason) = active_process_reason(
+            snapshot.policy,
+            &running_agent_names(),
+            &snapshot.guard_hint,
+        ) {
+            result.failures.push(CleanupFailure {
+                id,
+                message: reason.into(),
+            });
+            continue;
+        }
+        match move_to_os_trash(&snapshot.path) {
             Ok(()) => {
                 result.trashed_ids.push(id);
-                result.reclaimed_bytes = result.reclaimed_bytes.saturating_add(bytes);
+                result.reclaimed_bytes = result
+                    .reclaimed_bytes
+                    .saturating_add(snapshot.fingerprint.bytes);
             }
             Err(message) => result.failures.push(CleanupFailure {
                 id,
@@ -909,6 +1060,55 @@ async fn trash_items(
         }
     }
     result
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn trash_items(
+    state: State<'_, AppState>,
+    scan_id: String,
+    item_ids: Vec<String>,
+) -> Result<CleanupResult, String> {
+    let (scan, selected) = {
+        let registry = lock_registry(&state);
+        (
+            registry.scan_id.clone(),
+            item_ids
+                .iter()
+                .filter_map(|id| {
+                    registry
+                        .entries
+                        .get(id)
+                        .cloned()
+                        .map(|snapshot| (id.clone(), snapshot))
+                })
+                .collect::<Vec<_>>(),
+        )
+    };
+    if scan_id != scan {
+        return Ok(CleanupResult {
+            trashed_ids: Vec::new(),
+            reclaimed_bytes: 0,
+            failures: vec![CleanupFailure {
+                id: String::new(),
+                message: "This scan has expired. Scan again before cleaning.".into(),
+            }],
+        });
+    }
+    let Some(home) = home_dir() else {
+        return Ok(CleanupResult {
+            trashed_ids: Vec::new(),
+            reclaimed_bytes: 0,
+            failures: vec![CleanupFailure {
+                id: String::new(),
+                message: "Could not find the current user's home folder.".into(),
+            }],
+        });
+    };
+    let result =
+        tauri::async_runtime::spawn_blocking(move || cleanup_selected(&home, item_ids, selected))
+            .await
+            .map_err(|_| "The cleanup could not finish.".to_string())?;
+    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -974,8 +1174,14 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", dir.join("link"))?;
         let mut budget = 0;
-        let fp = inspect_tree(&dir, Instant::now(), &mut budget)
-            .map_err(|e| std::io::Error::other(e))?;
+        let fp = inspect_tree(
+            &dir,
+            Instant::now(),
+            &mut budget,
+            MAX_SCAN_SECONDS,
+            MAX_VISITED,
+        )
+        .map_err(std::io::Error::other)?;
         assert_eq!(fp.bytes, 5);
         assert_eq!(fp.file_count, 1);
         Ok(())
@@ -1012,6 +1218,96 @@ mod tests {
     }
 
     #[test]
+    fn cache_candidates_are_allowlisted_and_never_include_cacache_parent()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = tmp.path().join("home");
+        let cache = home.join(".npm/_cacache");
+        fs::create_dir_all(cache.join("content-v2/aa"))?;
+        fs::write(cache.join("content-v2/aa/chunk"), "cached")?;
+        fs::create_dir_all(cache.join("index-v5"))?;
+        fs::write(cache.join("index-v5/index"), "index")?;
+        let mut budget = 0;
+        let mut warnings = Vec::new();
+        let found = cache_candidates(&home, Instant::now(), &mut budget, &mut warnings);
+        assert!(!found.is_empty());
+        for (path, _) in found {
+            assert_ne!(path, cache.join("content-v2"));
+            assert!(
+                policy_root_allows(&path, &home, Policy::Cache),
+                "cache candidate escaped the cleanup allowlist"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_rejects_unknown_and_read_only_items_without_moving_files()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = tmp.path().join("home");
+        let downloads = home.join("Downloads/large.mov");
+        fs::create_dir_all(downloads.parent().ok_or("missing parent")?)?;
+        fs::write(&downloads, "keep")?;
+        let snapshot = Snapshot {
+            path: downloads.clone(),
+            policy: Policy::ReadOnly,
+            cleanable: false,
+            guard_hint: "Large download taking up space".into(),
+            fingerprint: fingerprint(&downloads).map_err(std::io::Error::other)?,
+        };
+        let protected = cleanup_selected(
+            &home,
+            vec!["read-only".into()],
+            vec![("read-only".into(), snapshot)],
+        );
+        assert_eq!(protected.trashed_ids.len(), 0);
+        assert_eq!(protected.failures.len(), 1);
+        assert!(downloads.exists());
+        let unknown = cleanup_selected(&home, vec!["unknown".into()], Vec::new());
+        assert_eq!(unknown.trashed_ids.len(), 0);
+        assert_eq!(unknown.failures.len(), 1);
+        assert!(downloads.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn process_guards_are_scoped_to_the_matching_cleanup_category() {
+        assert!(active_process_reason(Policy::Session, &["node".into()], "").is_none());
+        assert!(
+            active_process_reason(Policy::Cache, &["node".into()], "npm package cache").is_some()
+        );
+        assert!(
+            active_process_reason(Policy::Cache, &["node".into()], "Homebrew download cache")
+                .is_none()
+        );
+        assert!(
+            active_process_reason(Policy::Cache, &["brew".into()], "Homebrew download cache")
+                .is_some()
+        );
+        assert!(active_process_reason(Policy::Developer, &["xcode".into()], "").is_some());
+        assert!(active_process_reason(Policy::Session, &["claude".into()], "").is_some());
+    }
+
+    #[test]
+    fn allowlist_rejects_symlinked_agent_roots() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = tmp.path().join("home");
+        let external = tmp.path().join("external");
+        fs::create_dir_all(external.join("projects/project"))?;
+        fs::write(external.join("projects/project/session.jsonl"), "history")?;
+        fs::create_dir_all(&home)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&external, home.join(".claude"))?;
+        assert!(!policy_allows(
+            &home.join(".claude/projects/project/session.jsonl"),
+            &home,
+            Policy::Session
+        ));
+        Ok(())
+    }
+
+    #[test]
     fn age_thresholds_keep_recent_caches_and_sessions_protected() {
         assert!(!is_old_enough(Policy::Cache, CACHE_MIN_AGE - 1));
         assert!(is_old_enough(Policy::Cache, CACHE_MIN_AGE));
@@ -1030,6 +1326,38 @@ mod tests {
         fs::write(&path, "a longer transcript")?;
         let after = fingerprint(&path).map_err(std::io::Error::other)?;
         assert_ne!(before, after);
+        fs::write(&path, "a longer transcript")?;
+        let same_size = fingerprint(&path).map_err(std::io::Error::other)?;
+        assert_eq!(after.bytes, same_size.bytes);
+        assert_ne!(after.digest, same_size.digest);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads the current user's home; run explicitly for native smoke"]
+    fn native_home_scan_smoke_reports_counts_without_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(home) = home_dir() else {
+            return Ok(());
+        };
+        let (report, _snapshots) = build_scan(&home).map_err(std::io::Error::other)?;
+        assert!(report.volume.total_bytes > 0);
+        let mut counts = HashMap::<String, usize>::new();
+        for item in &report.items {
+            *counts.entry(item.category.clone()).or_default() += 1;
+        }
+        assert!(
+            counts.len() > 1,
+            "the scan should reserve capacity for multiple categories"
+        );
+        println!(
+            "Read-only storage scan smoke: agents={}, caches={}, developer={}, large={}, warnings={}",
+            counts.get("agents").copied().unwrap_or(0),
+            counts.get("caches").copied().unwrap_or(0),
+            counts.get("developer").copied().unwrap_or(0),
+            counts.get("large").copied().unwrap_or(0),
+            report.warnings.len()
+        );
         Ok(())
     }
 }
