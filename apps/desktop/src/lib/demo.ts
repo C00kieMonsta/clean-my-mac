@@ -1,4 +1,4 @@
-import type { ScanItem, ScanReport } from "@clean-my-mac/core";
+import type { ScanItem, ScanReport, SystemInsights } from "@clean-my-mac/core";
 const GB = 1_000_000_000;
 const now = Date.now();
 const item = (
@@ -149,5 +149,13 @@ export const demoReport: ScanReport = {
       "Personal downloads are review-only. Manage this file in Finder.",
     ),
   ],
+  warnings: [],
+};
+
+export const demoInsights: SystemInsights = {
+  snapshots: [{ name: "com.apple.TimeMachine.2026-10-29-035402.local", volume: "Macintosh HD", purgeable: true }],
+  processes: [{ pid: 482, name: "Docker Desktop", memoryBytes: 2.4 * GB, cpuPercent: 4.2 }, { pid: 831, name: "Code Helper", memoryBytes: 1.1 * GB, cpuPercent: 1.8 }],
+  launchAgents: [{ path: "~/Library/LaunchAgents/com.example.helper.plist", label: "com.example.helper", program: "/Applications/Example.app/Contents/MacOS/helper", programExists: false, system: false }],
+  deletedOpenFiles: [{ pid: 482, process: "Docker Desktop", path: "~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw (deleted)", bytes: 1.7 * GB }],
   warnings: [],
 };

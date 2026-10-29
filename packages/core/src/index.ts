@@ -15,14 +15,32 @@ export interface ScanItem {
   cleanable: boolean;
   requiresAck?: boolean;
   reason?: string | null;
+  cleanupKind?: "trash" | "git";
+  details?: string;
+}
+
+export interface ScanCoverage {
+  mode: "quick" | "deep";
+  detectors: number;
+  visitedEntries: number;
+  elapsedMs: number;
+}
+
+export interface SystemInsights {
+  snapshots: { name: string; volume: string; purgeable: boolean | null }[];
+  processes: { pid: number; name: string; memoryBytes: number; cpuPercent: number }[];
+  launchAgents: { path: string; label: string; program: string | null; programExists: boolean | null; system: boolean }[];
+  deletedOpenFiles: { pid: number; process: string; path: string; bytes: number }[];
+  warnings: string[];
 }
 
 export interface ScanReport {
   id: string;
   scannedAt: number;
-  volume: { name: string; totalBytes: number; availableBytes: number };
+  volume: { name: string; totalBytes: number; availableBytes: number; freeBytes?: number; purgeableBytes?: number; availableForImportantUsageBytes?: number };
   items: ScanItem[];
   warnings: string[];
+  coverage?: ScanCoverage;
 }
 
 export interface CleanupResult {

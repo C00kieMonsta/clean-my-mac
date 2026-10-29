@@ -4,7 +4,7 @@ Clean My Mac is a local storage tool. The app reads metadata from a small allowl
 
 ## What a scan can inspect
 
-The scanner checks known coding-agent history, caches and logs, selected developer data, and large files directly in Downloads. It does not scan all of Macintosh HD. Older inactive caches can be recommended. Recent or in-use histories and caches, Hugging Face model files, and Downloads files can be selected manually after an explicit risk acknowledgement.
+Automatic scans check known coding-agent history, caches and logs, selected developer data, and large files directly in Downloads. They do not scan all of Macintosh HD. You can also choose a folder manually. The selected folder is reviewed as one item, and all its contents move to Trash if you confirm. Older inactive caches can be recommended. Recent or in-use histories and caches, Hugging Face model files, Downloads files, and manually chosen folders require an explicit risk acknowledgement.
 
 | Category | Locations |
 | --- | --- |
@@ -18,7 +18,7 @@ Agent session data can contain prompts, tool output, or source code. The app sho
 
 ## Cleanup
 
-A scan does not alter files. The user selects eligible entries and confirms before cleanup. Items marked for review require an explicit acknowledgement before Clean My Mac asks macOS to move them to Trash. This includes recent or in-use histories and caches, Hugging Face model files, and direct Downloads files. The app does not permanently unlink files or use administrator access. A path that changed since the scan, is a symbolic link, falls outside a known root, or cannot safely be moved is rejected or skipped and shown as a failure.
+A scan does not alter files. The user selects eligible entries and confirms before cleanup. Items marked for review require an explicit acknowledgement before Clean My Mac asks macOS to move them to Trash. A manually chosen folder is treated as one item. Its contents may include personal files, so review the path before confirming. The app does not permanently unlink files or use administrator access. A path that changed since the scan, is a symbolic link, falls outside an approved root, or cannot safely be moved is rejected or skipped and shown as a failure.
 
 Each scan is limited to 30 seconds, 500,000 visited entries, and 5,000 findings. Agent traversal has separate limits of 5 seconds, 30,000 visited entries, and 1,500 findings. It skips symbolic links, reports unreadable locations as warnings, and may return partial results when it reaches a limit. Unlisted personal data, system locations, application bundles, settings, and credentials are outside its cleanup allowlist.
 

@@ -18,6 +18,8 @@ const SESSION_MIN_AGE: u64 = 30 * DAY;
 const LARGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCAN_SECONDS: u64 = 30;
 const MAX_VISITED: usize = 500_000;
+const MAX_TEMP_SCAN_SECONDS: u64 = 10;
+const MAX_TEMP_VISITED: usize = 200_000;
 const MAX_SCAN_ITEMS: usize = 5_000;
 const MAX_AGENT_ITEMS: usize = 1_500;
 const MAX_AGENT_VISITED: usize = 30_000;
@@ -80,6 +82,8 @@ enum Policy {
     Cache,
     Session,
     Developer,
+    Temporary,
+    Manual,
     ReadOnly,
 }
 
@@ -107,6 +111,7 @@ struct Fingerprint {
 struct Registry {
     scan_id: String,
     entries: HashMap<String, Snapshot>,
+    items: HashMap<String, Item>,
 }
 
 #[derive(Clone, Default)]
@@ -144,6 +149,92 @@ fn home_dir() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
+}
+
+fn current_user_temp_root() -> Option<PathBuf> {
+    let root = fs::canonicalize(std::env::temp_dir()).ok()?;
+    let metadata = fs::symlink_metadata(&root).ok()?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return None;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: getuid does not take pointers or mutate process state.
+        if metadata.uid() != unsafe { libc::getuid() } {
+            return None;
+        }
+    }
+    Some(root)
+}
+
+fn is_generated_temp_name(name: &std::ffi::OsStr) -> bool {
+    let name = name.to_string_lossy();
+    name.starts_with("cdk.out") || name.starts_with("jest_")
+}
+
+fn temporary_path_is_allowlisted(path: &Path, root: &Path) -> bool {
+    path.parent() == Some(root)
+        && path.file_name().is_some_and(is_generated_temp_name)
+        && fs::symlink_metadata(path)
+            .is_ok_and(|meta| meta.is_dir() && !meta.file_type().is_symlink())
+        && no_symlink_path(path, root)
+}
+
+fn manual_path_is_allowlisted(path: &Path, home: &Path) -> bool {
+    let Ok(canonical_path) = fs::canonicalize(path) else {
+        return false;
+    };
+    if canonical_path != path {
+        return false;
+    }
+    let Ok(canonical_home) = fs::canonicalize(home) else {
+        return false;
+    };
+    if !fs::symlink_metadata(&canonical_path)
+        .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+    {
+        return false;
+    }
+    let temp_root = current_user_temp_root();
+    let home_descendant =
+        canonical_path != canonical_home && canonical_path.starts_with(&canonical_home);
+    let temp_descendant = temp_root
+        .as_ref()
+        .is_some_and(|root| canonical_path != *root && canonical_path.starts_with(root));
+    if temp_root
+        .as_ref()
+        .is_some_and(|root| canonical_path == *root)
+    {
+        return false;
+    }
+    if !home_descendant && !temp_descendant {
+        return false;
+    }
+    if canonical_path == canonical_home.join("Library") {
+        return false;
+    }
+    let protected_roots = [
+        canonical_home.join(".ssh"),
+        canonical_home.join(".gnupg"),
+        canonical_home.join(".aws"),
+        canonical_home.join("Library/Keychains"),
+        canonical_home.join("Library/Accounts"),
+        canonical_home.join(".codex/auth"),
+        canonical_home.join(".claude/credentials"),
+        canonical_home.join(".claude/credentials.json"),
+    ];
+    if protected_roots.iter().any(|protected| {
+        canonical_path.starts_with(protected) || protected.starts_with(&canonical_path)
+    }) {
+        return false;
+    }
+    let boundary = if home_descendant {
+        canonical_home.as_path()
+    } else {
+        temp_root.as_deref().unwrap_or(Path::new("/"))
+    };
+    no_symlink_path(&canonical_path, boundary)
 }
 
 fn metadata_identity(meta: &Metadata) -> (u64, u64) {
@@ -519,6 +610,8 @@ fn push_candidate(
     }
     let (max_seconds, max_entries) = if policy == Policy::Session {
         (MAX_AGENT_SCAN_SECONDS, MAX_AGENT_VISITED)
+    } else if policy == Policy::Temporary {
+        (MAX_TEMP_SCAN_SECONDS, MAX_TEMP_VISITED)
     } else {
         (MAX_SCAN_SECONDS, MAX_VISITED)
     };
@@ -569,6 +662,18 @@ fn push_candidate(
             Some(process_reason.unwrap_or(
                 "Build files can belong to recent or active work. Review before clearing.",
             )),
+        ),
+        Policy::Temporary => (
+            true,
+            true,
+            "review",
+            Some("Temporary build or test data may belong to active work. Review before clearing."),
+        ),
+        Policy::Manual => (
+            true,
+            true,
+            "review",
+            Some("This folder and all its contents will move to Trash. It may contain personal files. Review it carefully."),
         ),
         Policy::ReadOnly => (
             true,
@@ -672,13 +777,53 @@ fn read_entries(
     found
 }
 
+fn temporary_candidates(
+    root: &Path,
+    started: Instant,
+    budget: &mut usize,
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    let mut candidates = Vec::new();
+    let limit = "The scan reached its safety limit. Some items may be missing.";
+    for entry in read_entries(
+        root,
+        started,
+        budget,
+        warnings,
+        limit,
+        MAX_TEMP_SCAN_SECONDS,
+        MAX_TEMP_VISITED,
+    ) {
+        if started.elapsed() > Duration::from_secs(MAX_TEMP_SCAN_SECONDS)
+            || *budget >= MAX_TEMP_VISITED
+            || candidates.len() >= MAX_SCAN_ITEMS
+        {
+            note_scan_warning(warnings, limit);
+            break;
+        }
+        let path = entry.path();
+        let Ok(metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && path.parent() == Some(root)
+            && path.file_name().is_some_and(is_generated_temp_name)
+            && no_symlink_path(&path, root)
+        {
+            candidates.push(path);
+        }
+    }
+    candidates
+}
+
 fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), String> {
     let started = Instant::now();
     let active_processes = running_agent_names();
     let mut items = Vec::new();
     let mut snapshots = HashMap::new();
     let mut warnings = Vec::new();
-    let mut budget = 0;
+    let mut budget: usize = 0;
     let limit_warning = "The scan reached its safety limit. Some items may be missing.";
     let agent_limit_warning =
         "The agent session scan reached its safety limit. Some sessions may be missing.";
@@ -757,6 +902,61 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                 }
             }
         }
+    }
+
+    // Keep this allowlist narrow and bounded. Run it after transcript discovery so
+    // repeated scans can surface additional direct-child temp folders.
+    if let Some(temp_root) = current_user_temp_root() {
+        let temp_started = Instant::now();
+        let mut temp_budget = 0;
+        let temp_paths =
+            temporary_candidates(&temp_root, temp_started, &mut temp_budget, &mut warnings);
+        for path in temp_paths {
+            if temp_started.elapsed() > Duration::from_secs(MAX_TEMP_SCAN_SECONDS)
+                || temp_budget >= MAX_TEMP_VISITED
+                || items.len() >= MAX_SCAN_ITEMS
+            {
+                note_scan_warning(
+                    &mut warnings,
+                    "Temporary cache scan reached its limit. Some cdk.out or jest_ folders may be missing.",
+                );
+                break;
+            }
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            let (description, source) = if name.starts_with("cdk.out") {
+                (
+                    "Cloud Development Kit staging output that can be regenerated",
+                    "Temporary Cloud Development Kit output",
+                )
+            } else {
+                (
+                    "Jest transform cache that can be regenerated",
+                    "Temporary Jest output",
+                )
+            };
+            push_candidate(
+                "developer",
+                Policy::Temporary,
+                path,
+                description.into(),
+                source.into(),
+                &active_processes,
+                temp_started,
+                &mut temp_budget,
+                &mut items,
+                &mut snapshots,
+                &mut warnings,
+            );
+        }
+        if temp_started.elapsed() > Duration::from_secs(MAX_TEMP_SCAN_SECONDS)
+            || temp_budget >= MAX_TEMP_VISITED
+        {
+            note_scan_warning(
+                &mut warnings,
+                "Temporary cache scan reached its limit. Some cdk.out or jest_ folders may be missing.",
+            );
+        }
+        budget = budget.saturating_add(temp_budget);
     }
 
     let derived_data = home.join("Library/Developer/Xcode/DerivedData");
@@ -896,7 +1096,113 @@ async fn scan_system(state: State<'_, AppState>) -> Result<ScanReport, String> {
     let mut registry = lock_registry(&state);
     registry.scan_id = report.id.clone();
     registry.entries = entries;
+    registry.items = report
+        .items
+        .iter()
+        .map(|item| (item.id.clone(), item.clone()))
+        .collect();
     Ok(report)
+}
+
+#[tauri::command(rename_all = "camelCase")]
+async fn pick_cleanup_folder(
+    state: State<'_, AppState>,
+    scan_id: String,
+) -> Result<Option<Item>, String> {
+    let state = state.inner().clone();
+    {
+        let registry = lock_registry(&state);
+        if registry.scan_id != scan_id {
+            return Err("This scan has expired. Scan again before choosing a folder.".into());
+        }
+    }
+    let Some(selected_path) = rfd::FileDialog::new()
+        .set_title("Choose a folder to review")
+        .pick_folder()
+    else {
+        return Ok(None);
+    };
+    let home =
+        home_dir().ok_or_else(|| "Could not find the current user's home folder.".to_string())?;
+    let path = fs::canonicalize(&selected_path)
+        .map_err(|error| format!("Could not resolve the selected folder: {error}"))?;
+    if !manual_path_is_allowlisted(&path, &home) {
+        return Err("Choose a folder inside your home folder or user temporary folder. Protected folders cannot be selected.".into());
+    }
+    {
+        let registry = lock_registry(&state);
+        if registry.scan_id != scan_id {
+            return Err("This scan has expired. Scan again before choosing a folder.".into());
+        }
+        if let Some((id, _)) = registry.entries.iter().find(|(_, snapshot)| {
+            fs::canonicalize(&snapshot.path).is_ok_and(|existing| existing == path)
+        }) && let Some(item) = registry.items.get(id)
+        {
+            return Ok(Some(item.clone()));
+        }
+    }
+    let path_for_scan = path.clone();
+    let fingerprint = tauri::async_runtime::spawn_blocking(move || {
+        let mut budget: usize = 0;
+        inspect_tree(
+            &path_for_scan,
+            Instant::now(),
+            &mut budget,
+            MAX_SCAN_SECONDS,
+            MAX_VISITED,
+        )
+    })
+    .await
+    .map_err(|_| "The selected folder could not be inspected.".to_string())??;
+    if !manual_path_is_allowlisted(&path, &home) {
+        return Err("The selected folder changed during inspection. Choose it again.".into());
+    }
+    let name = path
+        .file_name()
+        .map(|value| value.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let mut item = Item {
+        id: format!("manual-{}-{}", now_millis(), Utc::now().timestamp_subsec_nanos()),
+        category: "developer".into(),
+        name,
+        path: path.display().to_string(),
+        bytes: fingerprint.bytes,
+        file_count: fingerprint.file_count,
+        modified_at: fingerprint.modified_secs.saturating_mul(1000),
+        description: "This folder and all its contents will move to Trash. It may contain personal files. Review it carefully.".into(),
+        source: "Added by you".into(),
+        risk: "review".into(),
+        cleanable: true,
+        requires_ack: true,
+        reason: Some("This folder may contain personal files. Review all contents before moving it to Trash.".into()),
+    };
+    let mut registry = lock_registry(&state);
+    if registry.scan_id != scan_id {
+        return Err("This scan has expired. Scan again before choosing a folder.".into());
+    }
+    if let Some((id, _)) = registry.entries.iter().find(|(_, snapshot)| {
+        fs::canonicalize(&snapshot.path).is_ok_and(|existing| existing == path)
+    }) && let Some(existing) = registry.items.get(id)
+    {
+        return Ok(Some(existing.clone()));
+    }
+    let base_id = item.id.clone();
+    let mut suffix = 1_u64;
+    while registry.entries.contains_key(&item.id) {
+        item.id = format!("{base_id}-{suffix}");
+        suffix = suffix.saturating_add(1);
+    }
+    let snapshot = Snapshot {
+        path,
+        policy: Policy::Manual,
+        cleanable: true,
+        requires_ack: true,
+        guard_hint: item.description.clone(),
+        fingerprint,
+    };
+    registry.entries.insert(item.id.clone(), snapshot);
+    registry.items.insert(item.id.clone(), item.clone());
+    Ok(Some(item))
 }
 
 fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
@@ -929,6 +1235,10 @@ fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
         Policy::Developer => path
             .parent()
             .is_some_and(|p| p == home.join("Library/Developer/Xcode/DerivedData")),
+        Policy::Temporary => {
+            current_user_temp_root().is_some_and(|root| temporary_path_is_allowlisted(path, &root))
+        }
+        Policy::Manual => manual_path_is_allowlisted(path, home),
         Policy::Session => {
             path.extension().is_some_and(|ext| ext == "jsonl")
                 && [
@@ -948,6 +1258,14 @@ fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
 }
 
 fn policy_allows(path: &Path, home: &Path, policy: Policy) -> bool {
+    if policy == Policy::Temporary {
+        return current_user_temp_root().is_some_and(|root| {
+            policy_root_allows(path, home, policy) && no_symlink_path(path, &root)
+        });
+    }
+    if policy == Policy::Manual {
+        return manual_path_is_allowlisted(path, home);
+    }
     policy_root_allows(path, home, policy) && no_symlink_path(path, home)
 }
 
@@ -956,6 +1274,8 @@ fn is_old_enough(policy: Policy, age_secs: u64) -> bool {
         Policy::Cache => age_secs >= CACHE_MIN_AGE,
         Policy::Session => age_secs >= SESSION_MIN_AGE,
         Policy::Developer => age_secs >= CACHE_MIN_AGE,
+        Policy::Temporary => false,
+        Policy::Manual => false,
         Policy::ReadOnly => false,
     }
 }
@@ -1055,6 +1375,36 @@ fn cleanup_selected(
         return result;
     }
     let selected_by_id: HashMap<_, _> = selected.into_iter().collect();
+    let mut paths_by_id = HashMap::<PathBuf, String>::new();
+    let mut aliases = HashMap::<String, String>::new();
+    unique_ids.retain(|id| {
+        let Some(snapshot) = selected_by_id.get(id) else {
+            return true;
+        };
+        if let Some(existing_id) = paths_by_id.get(&snapshot.path) {
+            aliases.insert(id.clone(), existing_id.clone());
+            false
+        } else {
+            paths_by_id.insert(snapshot.path.clone(), id.clone());
+            true
+        }
+    });
+    let selected_paths: Vec<_> = unique_ids
+        .iter()
+        .filter_map(|id| selected_by_id.get(id).map(|snapshot| &snapshot.path))
+        .collect();
+    if selected_paths.iter().enumerate().any(|(index, path)| {
+        selected_paths
+            .iter()
+            .skip(index + 1)
+            .any(|other| path != other && (path.starts_with(other) || other.starts_with(path)))
+    }) {
+        result.failures.push(CleanupFailure {
+            id: String::new(),
+            message: "Select the folder or its contents, not both.".into(),
+        });
+        return result;
+    }
     let active_processes = running_agent_names();
     for id in unique_ids {
         let Some(snapshot) = selected_by_id.get(&id) else {
@@ -1122,6 +1472,21 @@ fn cleanup_selected(
                 id,
                 message: format!("Could not move this item to Trash: {message}"),
             }),
+        }
+    }
+    for (alias_id, owner_id) in aliases {
+        if result.trashed_ids.contains(&owner_id) {
+            result.trashed_ids.push(alias_id);
+        } else if let Some(message) = result
+            .failures
+            .iter()
+            .find(|failure| failure.id == owner_id)
+            .map(|failure| failure.message.clone())
+        {
+            result.failures.push(CleanupFailure {
+                id: alias_id,
+                message,
+            });
         }
     }
     result
@@ -1194,9 +1559,7 @@ fn reveal_item(state: State<'_, AppState>, scan_id: String, item_id: String) -> 
     };
     let home =
         home_dir().ok_or_else(|| "Could not find the current user's home folder.".to_string())?;
-    if !policy_root_allows(&snapshot.path, &home, snapshot.policy)
-        || !no_symlink_path(&snapshot.path, &home)
-    {
+    if !policy_allows(&snapshot.path, &home, snapshot.policy) {
         return Err("This location is outside the scan's safe paths.".into());
     }
     #[cfg(target_os = "macos")]
@@ -1219,6 +1582,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             scan_system,
+            pick_cleanup_folder,
             trash_items,
             reveal_item
         ])
@@ -1241,7 +1605,7 @@ mod tests {
         file.write_all(b"hello")?;
         #[cfg(unix)]
         std::os::unix::fs::symlink("/etc/passwd", dir.join("link"))?;
-        let mut budget = 0;
+        let mut budget: usize = 0;
         let fp = inspect_tree(
             &dir,
             Instant::now(),
@@ -1259,7 +1623,9 @@ mod tests {
     fn cleanup_policy_is_allowlisted_and_downloads_are_direct_files_only()
     -> Result<(), Box<dyn std::error::Error>> {
         let tmp = TempDir::new()?;
-        let home = tmp.path().join("home");
+        let home_path = tmp.path().join("home");
+        fs::create_dir_all(&home_path)?;
+        let home = fs::canonicalize(home_path)?;
         let download = home.join("Downloads/movie.mov");
         fs::create_dir_all(download.parent().ok_or("missing Downloads")?)?;
         fs::write(&download, "movie")?;
@@ -1313,7 +1679,7 @@ mod tests {
         fs::write(cache.join("content-v2/aa/chunk"), "cached")?;
         fs::create_dir_all(cache.join("index-v5"))?;
         fs::write(cache.join("index-v5/index"), "index")?;
-        let mut budget = 0;
+        let mut budget: usize = 0;
         let mut warnings = Vec::new();
         let found = cache_candidates(&home, Instant::now(), &mut budget, &mut warnings);
         assert!(!found.is_empty());
@@ -1378,6 +1744,197 @@ mod tests {
         assert!(is_offline_model_cache(
             "Hugging Face downloaded model cache. Removing it may make models unavailable offline."
         ));
+    }
+
+    #[test]
+    fn temporary_candidates_are_direct_named_directories_and_require_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let root = fs::canonicalize(tmp.path())?;
+        let cdk = root.join("cdk.out-example");
+        let jest = root.join("jest_transform_example");
+        let generic = root.join("DockerDesktopUpdates");
+        let nested_parent = root.join("nested");
+        fs::create_dir(&cdk)?;
+        fs::write(cdk.join("artifact"), "generated")?;
+        fs::create_dir(&jest)?;
+        fs::create_dir(&generic)?;
+        fs::create_dir(&nested_parent)?;
+        fs::create_dir(nested_parent.join("cdk.out-nested"))?;
+
+        assert!(temporary_path_is_allowlisted(&cdk, &root));
+        assert!(temporary_path_is_allowlisted(&jest, &root));
+        assert!(!temporary_path_is_allowlisted(&generic, &root));
+        assert!(!temporary_path_is_allowlisted(
+            &nested_parent.join("cdk.out-nested"),
+            &root
+        ));
+        assert!(current_user_temp_root().is_some_and(|temp_root| {
+            fs::canonicalize(std::env::temp_dir()).is_ok_and(|expected| temp_root == expected)
+        }));
+
+        let mut budget: usize = 0;
+        let mut items = Vec::new();
+        let mut snapshots = HashMap::new();
+        let mut warnings = Vec::new();
+        push_candidate(
+            "developer",
+            Policy::Temporary,
+            cdk,
+            "Cloud Development Kit staging output that can be regenerated".into(),
+            "Temporary Cloud Development Kit output".into(),
+            &[],
+            Instant::now(),
+            &mut budget,
+            &mut items,
+            &mut snapshots,
+            &mut warnings,
+        );
+        assert_eq!(items.len(), 1);
+        assert!(items[0].cleanable);
+        assert!(items[0].requires_ack);
+        assert_eq!(items[0].risk, "review");
+        assert!(
+            items[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("Review"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn manual_folder_policy_allows_home_descendants_and_rejects_protected_roots()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home_path = tmp.path().join("home");
+        fs::create_dir_all(&home_path)?;
+        let home = fs::canonicalize(home_path)?;
+        let safe = home.join("Developer/project/build");
+        let library = home.join("Library");
+        let ssh = home.join(".ssh");
+        let gnupg = home.join(".gnupg");
+        let aws = home.join(".aws");
+        let keychains = library.join("Keychains");
+        let accounts = library.join("Accounts");
+        let codex = home.join(".codex");
+        let auth = codex.join("auth");
+        let sessions = codex.join("sessions");
+        let claude_credentials = home.join(".claude/credentials");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&safe)?;
+        fs::create_dir_all(&keychains)?;
+        fs::create_dir_all(&accounts)?;
+        fs::create_dir_all(&ssh)?;
+        fs::create_dir_all(&auth)?;
+        fs::create_dir_all(&sessions)?;
+        fs::create_dir_all(&gnupg)?;
+        fs::create_dir_all(&aws)?;
+        fs::create_dir_all(&claude_credentials)?;
+        fs::create_dir_all(&outside)?;
+        let outside = fs::canonicalize(outside)?;
+        assert!(manual_path_is_allowlisted(&safe, &home));
+        assert!(policy_root_allows(&safe, &home, Policy::Manual));
+        assert!(!manual_path_is_allowlisted(&home, &home));
+        assert!(!manual_path_is_allowlisted(&library, &home));
+        assert!(!manual_path_is_allowlisted(&ssh, &home));
+        assert!(!manual_path_is_allowlisted(&gnupg, &home));
+        assert!(!manual_path_is_allowlisted(&aws, &home));
+        assert!(!manual_path_is_allowlisted(&keychains, &home));
+        assert!(!manual_path_is_allowlisted(&accounts, &home));
+        assert!(!manual_path_is_allowlisted(&auth, &home));
+        assert!(!manual_path_is_allowlisted(&codex, &home));
+        assert!(!manual_path_is_allowlisted(&claude_credentials, &home));
+        assert!(manual_path_is_allowlisted(&sessions, &home));
+        // The sibling fixture is still inside the current user's allowed temp folder.
+        assert!(manual_path_is_allowlisted(&outside, &home));
+        assert!(!manual_path_is_allowlisted(Path::new("/System"), &home));
+        assert!(!manual_path_is_allowlisted(Path::new("/"), &home));
+        assert!(
+            TempDir::new_in(std::env::temp_dir())
+                .ok()
+                .is_some_and(|temp_folder| fs::canonicalize(temp_folder.path())
+                    .is_ok_and(|path| manual_path_is_allowlisted(&path, &home)))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_rejects_overlapping_folder_and_child_before_moving_anything()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home_path = tmp.path().join("home");
+        fs::create_dir_all(&home_path)?;
+        let home = fs::canonicalize(home_path)?;
+        let parent = home.join("selected");
+        let child = parent.join("child");
+        fs::create_dir_all(&child)?;
+        fs::write(parent.join("keep"), "parent data")?;
+        fs::write(child.join("keep"), "child data")?;
+        let snapshot = |path: &Path| -> Result<Snapshot, Box<dyn std::error::Error>> {
+            Ok(Snapshot {
+                path: path.to_path_buf(),
+                policy: Policy::Manual,
+                cleanable: true,
+                requires_ack: true,
+                guard_hint: "Manually selected folder".into(),
+                fingerprint: fingerprint(path).map_err(std::io::Error::other)?,
+            })
+        };
+        let result = cleanup_selected(
+            &home,
+            vec!["parent".into(), "child".into()],
+            vec![
+                ("parent".into(), snapshot(&parent)?),
+                ("child".into(), snapshot(&child)?),
+            ],
+            true,
+        );
+        assert!(result.trashed_ids.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert!(
+            result.failures[0]
+                .message
+                .contains("folder or its contents")
+        );
+        assert!(parent.join("keep").exists());
+        assert!(child.join("keep").exists());
+
+        let stale_fingerprint = fingerprint(&parent).map_err(std::io::Error::other)?;
+        fs::write(parent.join("changed"), "changed after the scan")?;
+        let duplicate_result = cleanup_selected(
+            &home,
+            vec!["manual-first".into(), "manual-duplicate".into()],
+            vec![
+                (
+                    "manual-first".into(),
+                    Snapshot {
+                        path: parent.clone(),
+                        policy: Policy::Manual,
+                        cleanable: true,
+                        requires_ack: true,
+                        guard_hint: "Manually selected folder".into(),
+                        fingerprint: stale_fingerprint,
+                    },
+                ),
+                (
+                    "manual-duplicate".into(),
+                    Snapshot {
+                        path: parent.clone(),
+                        policy: Policy::Manual,
+                        cleanable: true,
+                        requires_ack: true,
+                        guard_hint: "Manually selected folder".into(),
+                        fingerprint: stale_fingerprint,
+                    },
+                ),
+            ],
+            true,
+        );
+        assert!(duplicate_result.trashed_ids.is_empty());
+        assert_eq!(duplicate_result.failures.len(), 2);
+        assert!(parent.join("keep").exists());
+        Ok(())
     }
 
     #[test]
@@ -1447,7 +2004,7 @@ mod tests {
         let session = home.join(".codex/sessions/recent.jsonl");
         fs::create_dir_all(session.parent().ok_or("missing session parent")?)?;
         fs::write(&session, "session data")?;
-        let mut budget = 0;
+        let mut budget: usize = 0;
         let mut items = Vec::new();
         let mut snapshots = HashMap::new();
         let mut warnings = Vec::new();

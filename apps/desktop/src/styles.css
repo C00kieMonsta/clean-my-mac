@@ -348,6 +348,12 @@ h1 {
 .scan-button {
   margin-top: 12px;
 }
+.page-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+}
 .storage-card {
   background: linear-gradient(115deg, #292a30, #25262b);
   border: 1px solid #3b3b45;
@@ -1434,4 +1440,21 @@ h1 {
 }
 .receipt-list > div > span {
   flex: 1;
+}
+.risk-acknowledgement {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin: 16px 0;
+  padding: 12px;
+  border: 1px solid #66503b;
+  border-radius: 7px;
+  background: #382f27;
+  color: #d8c6ae;
+  font-size: 11px;
+  line-height: 1.6;
+  cursor: pointer;
+}
+.risk-acknowledgement .checkbox {
+  margin-top: 2px;
 }

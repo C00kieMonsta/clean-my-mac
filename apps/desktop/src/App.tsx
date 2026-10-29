@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowRight,
+  Activity,
   Bot,
   Check,
   CheckCheck,
@@ -11,6 +12,7 @@ import {
   Code2,
   Database,
   FileSearch,
+  FolderPlus,
   FolderOpen,
   HardDrive,
   Info,
@@ -33,11 +35,20 @@ import {
   type Category,
   type ScanItem,
   type ScanReport,
+  type SystemInsights,
 } from "@clean-my-mac/core";
-import { previewMode, revealItem, scanSystem, trashItems } from "./lib/bridge";
+import {
+  pickCleanupFolder,
+  previewMode,
+  revealItem,
+  scanSystem,
+  systemInsights,
+  openSystemSettings,
+  trashItems,
+} from "./lib/bridge";
 import { Modal } from "./components/Modal";
 
-type View = "overview" | Category;
+type View = "overview" | "system" | Category;
 type Filter = "all" | "recommended" | "review";
 const MAX_SELECTION = 200;
 const icons = {
@@ -52,6 +63,7 @@ const viewTitles: Record<View, string> = {
   caches: "Caches & logs",
   developer: "Developer files",
   large: "Large files",
+  system: "System insights",
 };
 
 function ageLabel(timestamp: number): string {
@@ -61,18 +73,34 @@ function ageLabel(timestamp: number): string {
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
+function pathsOverlap(left: string, right: string): boolean {
+  const normalizedLeft = left.replace(/\/+$/, "");
+  const normalizedRight = right.replace(/\/+$/, "");
+  return (
+    normalizedLeft === normalizedRight ||
+    normalizedLeft.startsWith(`${normalizedRight}/`) ||
+    normalizedRight.startsWith(`${normalizedLeft}/`)
+  );
+}
 
 export default function App() {
   const [view, setView] = useState<View>("overview");
   const [report, setReport] = useState<ScanReport | null>(null);
   const [scanning, setScanning] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+  const [addingFolder, setAddingFolder] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [riskAcknowledged, setRiskAcknowledged] = useState(false);
   const [expanded, setExpanded] = useState<Set<Category>>(new Set());
   const [limits, setLimits] = useState<Partial<Record<Category, number>>>({});
   const [filter, setFilter] = useState<Filter>("all");
   const [query, setQuery] = useState("");
+  const [deepScan, setDeepScan] = useState(false);
+  const [source, setSource] = useState("all");
+  const [sort, setSort] = useState<"largest" | "oldest" | "source">("largest");
+  const [insights, setInsights] = useState<SystemInsights | null>(null);
+  const [insightsBusy, setInsightsBusy] = useState(false);
+  const [insightsError, setInsightsError] = useState<string | null>(null);
   const [modal, setModal] = useState<"cleanup" | "help" | "receipt" | null>(
     null,
   );
@@ -88,6 +116,7 @@ export default function App() {
   const needsRiskAcknowledgement = chosen.some(
     (item) => item.requiresAck ?? item.risk !== "safe",
   );
+  const hasGit = chosen.some((item) => item.cleanupKind === "git");
   const recommended = eligible.filter((item) => item.risk === "safe");
   const reclaimable = totalBytes(eligible);
   const usedBytes = report
@@ -105,13 +134,13 @@ export default function App() {
         )
       : 0;
 
-  async function scan() {
+  async function scan(deep = deepScan) {
     if (scanRunning.current) return;
     scanRunning.current = true;
     setScanning(true);
     setNotice(null);
     try {
-      const next = await scanSystem();
+      const next = await scanSystem(deep);
       setReport(next);
       setSelected(new Set());
     } catch (error) {
@@ -119,6 +148,73 @@ export default function App() {
     } finally {
       setScanning(false);
       scanRunning.current = false;
+    }
+  }
+  async function loadInsights() {
+    setInsightsBusy(true);
+    setInsightsError(null);
+    try { setInsights(await systemInsights()); }
+    catch (error) { setInsightsError(errorMessage(error)); }
+    finally { setInsightsBusy(false); }
+  }
+  async function settings(section: "storage" | "timeMachine" | "loginItems") {
+    try { await openSystemSettings(section); }
+    catch (error) { setNotice({ text: errorMessage(error), error: true }); }
+  }
+  async function addFolder() {
+    if (!report || scanning || cleaning || addingFolder) return;
+    setAddingFolder(true);
+    setNotice(null);
+    try {
+      const picked = await pickCleanupFolder(report.id);
+      if (!picked) return;
+
+      const existing = report.items.find((item) => item.path === picked.path);
+      const item = existing ? { ...picked, id: existing.id } : picked;
+      const remaining = new Set(
+        [...selected].filter((id) => {
+          if (id === item.id) return true;
+          const selectedItem = report.items.find((candidate) => candidate.id === id);
+          return !selectedItem || !pathsOverlap(selectedItem.path, picked.path);
+        }),
+      );
+      if (!remaining.has(item.id) && remaining.size >= MAX_SELECTION) {
+        setNotice({
+          text: "Selection is limited to 200 items. Remove some items before adding this folder.",
+          error: false,
+        });
+        return;
+      }
+
+      setReport((previous) => {
+        if (!previous) return previous;
+        const existingIndex = previous.items.findIndex(
+          (candidate) => candidate.path === picked.path,
+        );
+        if (existingIndex < 0) return { ...previous, items: [...previous.items, picked] };
+        const items = [...previous.items];
+        items[existingIndex] = item;
+        return { ...previous, items };
+      });
+      remaining.add(item.id);
+      setSelected(remaining);
+      setRiskAcknowledged(false);
+      setView("developer");
+      setExpanded(new Set<Category>(["developer"]));
+      setFilter("all");
+      setQuery("");
+      setLimits((previous) => ({
+        ...previous,
+        developer: Math.max(
+          previous.developer ?? 30,
+          report.items.filter((candidate) => candidate.category === "developer")
+            .length + 1,
+        ),
+      }));
+    } catch (error) {
+      setNotice({ text: errorMessage(error), error: true });
+    } finally {
+      setAddingFolder(false);
     }
   }
   useEffect(() => {
@@ -228,7 +324,7 @@ export default function App() {
       setRiskAcknowledged(false);
       setModal(null);
       setNotice({
-        text: `${result.trashedIds.length} item${result.trashedIds.length === 1 ? "" : "s"} moved to Trash (${formatBytes(result.reclaimedBytes)}). Empty Trash in Finder to free disk space.${result.failures.length ? ` ${result.failures.length} item(s) were kept: ${result.failures.map((failure) => failure.message).join(" ")}` : ""}`,
+        text: `${result.trashedIds.length} item${result.trashedIds.length === 1 ? "" : "s"} ${hasGit ? "cleaned" : "moved to Trash"} (${formatBytes(result.reclaimedBytes)}).${hasGit ? " Worktree cleanup preserves its branch and cannot be restored from Trash." : " Empty Trash in Finder to free disk space."}${result.failures.length ? ` ${result.failures.length} item(s) were kept: ${result.failures.map((failure) => failure.message).join(" ")}` : ""}`,
         error: result.failures.length > 0,
       });
     } catch (error) {
@@ -248,13 +344,16 @@ export default function App() {
             : item.risk !== "safe" || !item.cleanable);
         return (
           matchesFilter &&
+          (source === "all" || item.source === source) &&
           `${item.name} ${item.source} ${item.path}`
             .toLowerCase()
             .includes(query.toLowerCase())
         );
       }),
-    [items, filter, query],
+    [items, filter, query, source],
   );
+  const displayedItems = useMemo(() => [...filteredItems].sort((a, b) => sort === "oldest" ? a.modifiedAt - b.modifiedAt : sort === "source" ? a.source.localeCompare(b.source) : b.bytes - a.bytes), [filteredItems, sort]);
+  useEffect(() => { if (view === "system") void loadInsights(); }, [view]);
 
   return (
     <div className="app-shell">
@@ -354,14 +453,24 @@ export default function App() {
                       ?.description + ". You decide what goes."}
               </p>
             </div>
-            <button
-              className="button secondary scan-button"
-              disabled={scanning || cleaning}
-              onClick={() => void scan()}
-            >
-              <RefreshCw size={15} className={scanning ? "spin" : ""} />
-              {scanning ? "Scanning your Mac…" : "Scan again"}
-            </button>
+            <div className="page-actions">
+              <button
+                className="button secondary scan-button"
+                disabled={scanning || cleaning || addingFolder}
+                onClick={() => void scan()}
+              >
+                <RefreshCw size={15} className={scanning ? "spin" : ""} />
+                {scanning ? "Scanning your Mac…" : "Scan again"}
+              </button>
+              <button
+                className="button secondary scan-button"
+                disabled={!report || scanning || cleaning || addingFolder}
+                onClick={() => void addFolder()}
+              >
+                <FolderPlus size={15} />
+                {addingFolder ? "Choosing folder…" : "Add folder"}
+              </button>
+            </div>
           </section>
 
           {notice && (
@@ -683,6 +792,9 @@ export default function App() {
                                           "Review first"
                                         )}
                                       </span>
+                                      {item.source === "Added by you" && (
+                                        <span className="badge">Added by you</span>
+                                      )}
                                     </div>
                                     <div
                                       className="file-path"
@@ -763,7 +875,7 @@ export default function App() {
             <div className="scan-footnote">
               <ShieldCheck size={14} />
               <span>
-                Your credentials, settings, and recent sessions stay put.
+                Your credentials and app settings stay out of cleanup.
               </span>
               <span className="scope-note">Known clutter folders only</span>
             </div>
@@ -814,10 +926,10 @@ export default function App() {
             <button
               className="button primary"
               disabled={!chosen.length || scanning || cleaning}
-                onClick={() => {
-                  setRiskAcknowledged(false);
-                  setModal("cleanup");
-                }}
+              onClick={() => {
+                setRiskAcknowledged(false);
+                setModal("cleanup");
+              }}
             >
               Review cleanup
               <ArrowRight size={16} />
@@ -844,9 +956,10 @@ export default function App() {
             <li>
               <strong>Scan known clutter folders</strong>
               <p>
-                We check Codex and Claude Code transcripts, selected app caches
-                and logs, Xcode build files, package caches, and large
-                Downloads.
+                We automatically check known Codex and Claude Code history,
+                app caches and logs, Xcode files, package caches, and large
+                Downloads. You can also add a folder manually. Its contents
+                will move together if you confirm cleanup.
               </p>
             </li>
             <li>
@@ -920,6 +1033,15 @@ export default function App() {
               </p>
             </div>
           )}
+          {chosen.some((item) => item.source === "Added by you") && (
+            <div className="help-note caution">
+              <Info size={17} />
+              <p>
+                The added folder and all files inside it will move to Trash.
+                Review its path and contents before continuing.
+              </p>
+            </div>
+          )}
           <div className="review-list">
             {chosen.map((item) => (
               <div key={item.id}>
@@ -934,7 +1056,7 @@ export default function App() {
           <p className="modal-caption">
             To restore, drag files from Trash to their original folders.
             Finder’s Put Back option may be unavailable. Space is freed when you
-            empty Trash. Changed or active files will be skipped.
+            empty Trash. Files changed since the scan will be skipped.
           </p>
           {needsRiskAcknowledgement && (
             <label className="risk-acknowledgement">
@@ -947,8 +1069,8 @@ export default function App() {
                 }
               />
               <span>
-                I understand these files may be in use or contain history I
-                need.
+                I understand these files may be in use, contain history I need,
+                or include personal data.
               </span>
             </label>
           )}

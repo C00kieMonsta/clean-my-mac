@@ -16,10 +16,11 @@ import {
   within,
 } from "@testing-library/react";
 import "@testing-library/jest-dom/vitest";
-import type { CleanupResult, ScanReport } from "@clean-my-mac/core";
+import type { CleanupResult, ScanItem, ScanReport } from "@clean-my-mac/core";
 
 const bridge = vi.hoisted(() => ({
   scanSystem: vi.fn(),
+  pickCleanupFolder: vi.fn(),
   trashItems: vi.fn(),
   revealItem: vi.fn(),
 }));
@@ -27,6 +28,7 @@ const bridge = vi.hoisted(() => ({
 vi.mock("./lib/bridge", () => ({
   previewMode: false,
   scanSystem: bridge.scanSystem,
+  pickCleanupFolder: bridge.pickCleanupFolder,
   trashItems: bridge.trashItems,
   revealItem: bridge.revealItem,
 }));
@@ -120,6 +122,26 @@ function navigateTo(label: string) {
   );
 }
 
+function addedFolder(
+  path = "/Users/antoineboxho/Developer/Personal/02_projects/talos-labs/target",
+  name = "Talos build output",
+): ScanItem {
+  return {
+    id: "manual-folder",
+    category: "developer",
+    name,
+    path,
+    bytes: 98_000_000_000,
+    fileCount: 72_000,
+    modifiedAt: 1_800_000_000_000,
+    description: "Folder added manually. All contents will move to Trash.",
+    source: "Added by you",
+    risk: "review",
+    cleanable: true,
+    requiresAck: true,
+  };
+}
+
 beforeAll(() => {
   // jsdom does not implement the native dialog methods used by the Tauri UI.
   HTMLDialogElement.prototype.showModal = function showModal() {
@@ -133,6 +155,7 @@ beforeAll(() => {
 beforeEach(() => {
   vi.clearAllMocks();
   bridge.scanSystem.mockResolvedValue(report);
+  bridge.pickCleanupFolder.mockResolvedValue(null);
   bridge.trashItems.mockResolvedValue({
     trashedIds: [],
     reclaimedBytes: 0,
@@ -144,6 +167,134 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Clean My Mac cleanup review", () => {
+  it("adds and selects a manually chosen folder and requires risk acknowledgement", async () => {
+    bridge.pickCleanupFolder.mockResolvedValue(addedFolder());
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+
+    fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+    const folder = await screen.findByRole("checkbox", {
+      name: "Select Talos build output",
+    });
+    expect(folder).toBeChecked();
+    expect(screen.getByText("Added by you")).toBeInTheDocument();
+    expect(bridge.pickCleanupFolder).toHaveBeenCalledWith("scan-123");
+
+    fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review your cleanup",
+    });
+    expect(
+      within(dialog).getByText(
+        "The added folder and all files inside it will move to Trash. Review its path and contents before continuing.",
+      ),
+    ).toBeInTheDocument();
+    const moveButton = within(dialog).getByRole("button", {
+      name: "Move to Trash",
+    });
+    expect(moveButton).toBeDisabled();
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "I understand these files may be in use, contain history I need, or include personal data.",
+      }),
+    );
+    fireEvent.click(moveButton);
+    await waitFor(() =>
+      expect(bridge.trashItems).toHaveBeenCalledWith(
+        "scan-123",
+        ["manual-folder"],
+        true,
+      ),
+    );
+  });
+
+  it("leaves the report unchanged when folder selection is cancelled", async () => {
+    bridge.pickCleanupFolder.mockResolvedValue(null);
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+
+    fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+    await waitFor(() =>
+      expect(bridge.pickCleanupFolder).toHaveBeenCalledWith("scan-123"),
+    );
+    expect(
+      screen.queryByRole("checkbox", { name: "Select Talos build output" }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("selects the existing item id when the picker returns a path already in the report", async () => {
+    bridge.pickCleanupFolder.mockResolvedValue(
+      addedFolder("~/Library/Caches/Browser", "Browser cache folder"),
+    );
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+    navigateTo("Caches & logs");
+    fireEvent.click(
+      await screen.findByRole("checkbox", { name: "Select Browser cache" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+
+    const added = await screen.findByRole("checkbox", {
+      name: "Select Browser cache folder",
+    });
+    expect(added).toBeChecked();
+    expect(screen.getByText("Added by you")).toBeInTheDocument();
+    expect(screen.getAllByRole("checkbox", { name: "Select Browser cache folder" })).toHaveLength(1);
+    fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review your cleanup",
+    });
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "I understand these files may be in use, contain history I need, or include personal data.",
+      }),
+    );
+    fireEvent.click(within(dialog).getByRole("button", { name: "Move to Trash" }));
+    await waitFor(() =>
+      expect(bridge.trashItems).toHaveBeenCalledWith(
+        "scan-123",
+        ["cache-old"],
+        true,
+      ),
+    );
+  });
+
+  it("drops selected descendants when adding a folder that contains them", async () => {
+    bridge.scanSystem.mockResolvedValue({
+      ...report,
+      items: report.items.map((item) =>
+        item.id === "cache-old"
+          ? {
+              ...item,
+              path: "/Users/antoineboxho/Developer/Personal/build/target/debug",
+            }
+          : item,
+      ),
+    });
+    bridge.pickCleanupFolder.mockResolvedValue(
+      addedFolder("/Users/antoineboxho/Developer/Personal/build/target"),
+    );
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+    navigateTo("Caches & logs");
+    fireEvent.click(
+      await screen.findByRole("checkbox", { name: "Select Browser cache" }),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Add folder" }));
+    const folder = await screen.findByRole("checkbox", {
+      name: "Select Talos build output",
+    });
+    expect(folder).toBeChecked();
+    expect(screen.getByText("98 GB selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review your cleanup",
+    });
+    expect(within(dialog).getByText("Talos build output")).toBeInTheDocument();
+    expect(within(dialog).queryByText("Browser cache")).not.toBeInTheDocument();
+  });
+
   it("allows manual review of recent files and downloads, while protected files stay unselectable", async () => {
     render(<App />);
     await screen.findByText("Macintosh HD");
@@ -178,7 +329,7 @@ describe("Clean My Mac cleanup review", () => {
     expect(moveButton).toBeDisabled();
     fireEvent.click(
       within(dialog).getByRole("checkbox", {
-        name: "I understand these files may be in use or contain history I need.",
+        name: "I understand these files may be in use, contain history I need, or include personal data.",
       }),
     );
     expect(moveButton).toBeEnabled();
@@ -270,7 +421,7 @@ describe("Clean My Mac cleanup review", () => {
     fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
     fireEvent.click(
       await screen.findByRole("checkbox", {
-        name: "I understand these files may be in use or contain history I need.",
+        name: "I understand these files may be in use, contain history I need, or include personal data.",
       }),
     );
     fireEvent.click(

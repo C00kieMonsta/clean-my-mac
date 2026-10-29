@@ -18,12 +18,15 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+rfd = { version = "0.17", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 trash = "5.2"
 sysinfo = "0.37"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSDictionary", "NSNumber"] }
 thiserror = "2"
 
 [dev-dependencies]

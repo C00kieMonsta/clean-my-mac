@@ -21,7 +21,7 @@ See [the build and release guide](docs/RELEASE.md) for local builds and download
 
 ## Privacy and safety
 
-The scanner reads only known user-owned folders. It follows neither symbolic links nor aliases. It applies item-count and traversal limits, and displays scan warnings when an area cannot be inspected. Direct files in Downloads are available for manual review. A changed path, symbolic link, or path outside a known root is rejected before cleanup. See [the privacy and cleanup model](docs/PRIVACY.md) for the scan locations and safeguards.
+Automatic scans read only known user-owned folders. You can also add a folder manually. The selected folder is reviewed as one item, and all its contents move to Trash if you confirm. The scanner follows neither symbolic links nor aliases. A changed path, symbolic link, or path outside an approved root is rejected before cleanup. See [the privacy and cleanup model](docs/PRIVACY.md) for details.
 
 Clean My Mac does not request administrator access, use `sudo`, or erase files directly. It asks macOS to move confirmed items to Trash. It does not clean operating system folders or scan the whole disk. These limits keep the app's recommendations understandable and protect personal data.
 
