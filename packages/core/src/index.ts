@@ -49,6 +49,36 @@ export interface ScanReport {
   coverage?: ScanCoverage;
 }
 
+export interface StorageUsage {
+  totalBytes: number;
+  freeBytes: number;
+  availableBytes: number;
+  usedBytes: number;
+  purgeableBytes: number;
+}
+
+/** Normalize APFS space values for display. Available space includes physical free space. */
+export function storageUsage(volume: ScanReport["volume"]): StorageUsage {
+  const finiteNonNegative = (value: number | undefined, fallback = 0) =>
+    Number.isFinite(value) ? Math.max(0, value as number) : fallback;
+  const totalBytes = finiteNonNegative(volume.totalBytes);
+  const freeBytes = Math.min(
+    totalBytes,
+    finiteNonNegative(volume.freeBytes, finiteNonNegative(volume.availableBytes)),
+  );
+  const availableBytes = Math.min(
+    totalBytes,
+    Math.max(freeBytes, finiteNonNegative(volume.availableForImportantUsageBytes, finiteNonNegative(volume.availableBytes))),
+  );
+  return {
+    totalBytes,
+    freeBytes,
+    availableBytes,
+    usedBytes: Math.max(0, totalBytes - availableBytes),
+    purgeableBytes: Math.max(0, availableBytes - freeBytes),
+  };
+}
+
 export interface CleanupResult {
   volumeAfter?: ScanReport["volume"] | null;
   trashedIds: string[];

@@ -1,5 +1,6 @@
 mod discovery;
 mod insights;
+mod source_guard;
 mod worktrees;
 
 use chrono::Utc;
@@ -141,6 +142,8 @@ struct Fingerprint {
     root_ino: u64,
     digest: u64,
     allocated_bytes: u64,
+    contains_source_code: bool,
+    contains_repository: bool,
 }
 
 #[derive(Default)]
@@ -278,6 +281,94 @@ fn allocated_size(meta: &Metadata) -> u64 {
     meta.blocks().saturating_mul(512)
 }
 
+fn known_generated_location(path: &Path) -> bool {
+    if let Some(home) = home_dir()
+        && (cache_roots(&home)
+            .iter()
+            .any(|(root, _)| path.starts_with(root))
+            || discovery::is_known_cache(path, &home)
+            || path.starts_with(home.join("Library/Developer/Xcode/DerivedData"))
+            || [
+                ".gradle/caches",
+                ".m2/repository",
+                ".nuget/packages",
+                ".cargo/registry",
+                ".cargo/git",
+                "Library/Caches/SwiftPM",
+                "Library/Developer/CoreSimulator/Caches",
+                "Library/Developer/Xcode/DocumentationCache",
+            ]
+            .iter()
+            .any(|root| path.starts_with(home.join(root))))
+    {
+        return true;
+    }
+    if current_user_temp_root().is_some_and(|root| temporary_path_is_allowlisted(path, &root)) {
+        return true;
+    }
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    let Some(parent) = path.parent() else {
+        return false;
+    };
+    match name {
+        name if name == "target" || name.starts_with("target-") => {
+            path.join(".rustc_info.json").is_file() || path.join("CACHEDIR.TAG").is_file()
+        }
+        "node_modules" => {
+            parent.join("package.json").is_file()
+                && (path.join(".package-lock.json").is_file()
+                    || path.join(".pnpm").is_dir()
+                    || path.join(".yarn-integrity").is_file()
+                    || parent.join("package-lock.json").is_file()
+                    || parent.join("pnpm-lock.yaml").is_file()
+                    || parent.join("yarn.lock").is_file()
+                    || parent.join("bun.lockb").is_file()
+                    || parent.join("bun.lock").is_file())
+        }
+        ".next" | ".nuxt" | ".turbo" | ".parcel-cache" | ".vite" | ".webpack" | ".angular"
+        | ".svelte-kit" => parent.join("package.json").is_file(),
+        ".venv" | "venv" => path.join("pyvenv.cfg").is_file(),
+        "Pods" => parent.join("Podfile").is_file() && path.join("Manifest.lock").is_file(),
+        ".gradle" => {
+            parent.join("settings.gradle").is_file() || parent.join("settings.gradle.kts").is_file()
+        }
+        ".dart_tool" => {
+            parent.join("pubspec.yaml").is_file() && path.join("package_config.json").is_file()
+        }
+        "coverage" => {
+            path.join("lcov.info").is_file() || path.join("coverage-final.json").is_file()
+        }
+        "__pycache__" => true,
+        _ => false,
+    }
+}
+
+fn source_safety_check(
+    path: &Path,
+    policy: Policy,
+    fingerprint: &Fingerprint,
+) -> Result<(), String> {
+    if matches!(policy, Policy::Worktree | Policy::Sensitive) {
+        return Err(
+            "Project worktrees and protected app data cannot be removed by this cleaner.".into(),
+        );
+    }
+    let generated = match policy {
+        Policy::Cache | Policy::Session | Policy::Developer | Policy::Temporary => true,
+        Policy::Discovered | Policy::Manual => known_generated_location(path),
+        _ => false,
+    };
+    source_guard::check(
+        path,
+        generated,
+        fingerprint.contains_source_code,
+        fingerprint.contains_repository,
+    )
+}
+
 fn metadata_identity(meta: &Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
@@ -325,6 +416,9 @@ fn measure_tree(
             root_ino,
             digest,
             allocated_bytes: allocated_size(&root_meta),
+            contains_source_code: source_guard::is_source_path(path)
+                || root_meta.mode() & 0o111 != 0,
+            contains_repository: source_guard::is_repository_marker(path),
         });
     }
     if !root_meta.is_dir() {
@@ -336,6 +430,8 @@ fn measure_tree(
     let mut count = 0_u64;
     let mut newest = modified_secs(&root_meta);
     let mut linked_files = HashSet::new();
+    let mut contains_source_code = source_guard::is_source_path(path);
+    let mut contains_repository = source_guard::is_repository_marker(path);
     while let Some(dir) = stack.pop() {
         if started.elapsed() > Duration::from_secs(max_seconds) || *budget >= max_entries {
             return Err(
@@ -357,9 +453,12 @@ fn measure_tree(
             let meta = fs::symlink_metadata(&child_path)
                 .map_err(|e| format!("Could not verify the item: {e}"))?;
             digest ^= metadata_digest(&child_path, &meta);
+            contains_source_code |= source_guard::is_source_path(&child_path);
+            contains_repository |= source_guard::is_repository_marker(&child_path);
             if meta.file_type().is_symlink() {
                 continue;
             }
+            contains_source_code |= meta.is_file() && meta.mode() & 0o111 != 0;
             newest = newest.max(modified_secs(&meta));
             if meta.is_dir() {
                 stack.push(child_path);
@@ -382,6 +481,8 @@ fn measure_tree(
         root_ino,
         digest,
         allocated_bytes: allocated,
+        contains_source_code,
+        contains_repository,
     })
 }
 
@@ -627,16 +728,16 @@ fn volume_info(home: &Path) -> Result<Volume, String> {
     let stats = unsafe { stats.assume_init() };
     let block = stats.f_frsize;
     let free = block.saturating_mul(stats.f_bavail as u64);
-    let capacity = insights::storage_capacity(home);
+    let capacity = insights::storage_capacity(home).unwrap_or_else(|| {
+        insights::normalize_capacity(block.saturating_mul(stats.f_blocks as u64), free, free)
+    });
     Ok(Volume {
         name: "Macintosh HD".into(),
-        total_bytes: block.saturating_mul(stats.f_blocks as u64),
-        available_bytes: free,
-        free_bytes: free,
-        purgeable_bytes: capacity.as_ref().map_or(0, |value| value.purgeable_bytes),
-        available_for_important_usage_bytes: capacity
-            .as_ref()
-            .map_or(free, |value| value.available_for_important_usage_bytes),
+        total_bytes: capacity.total_bytes,
+        available_bytes: capacity.available_for_important_usage_bytes,
+        free_bytes: capacity.free_bytes,
+        purgeable_bytes: capacity.purgeable_bytes,
+        available_for_important_usage_bytes: capacity.available_for_important_usage_bytes,
     })
 }
 
@@ -784,8 +885,11 @@ fn register_candidate(
             "review",
             Some("This folder and all its contents will move to Trash. It may contain personal files. Review it carefully."),
         ),
-        Policy::Discovered | Policy::Worktree => (
+        Policy::Discovered => (
             true, true, "review", Some("Review this discovered location and its contents before cleanup."),
+        ),
+        Policy::Worktree => (
+            false, false, "protected", Some("Worktrees contain project source code. They cannot be removed by this cleaner."),
         ),
         Policy::Sensitive => (
             false, false, "protected", Some("This contains app state, backups, or model data. Inspect it in Finder or manage it in the owning app."),
@@ -797,6 +901,18 @@ fn register_candidate(
             Some("This is a file in Downloads. Review it before moving it to Trash."),
         ),
     };
+    let source_reason = if cleanable {
+        source_safety_check(&path, policy, &fp).err()
+    } else {
+        None
+    };
+    let cleanable = cleanable && source_reason.is_none();
+    let risk = if source_reason.is_some() {
+        "protected"
+    } else {
+        risk
+    };
+    let requires_ack = requires_ack && cleanable;
     let id = format!("item-{}", items.len());
     let item = Item {
         id: id.clone(),
@@ -811,12 +927,8 @@ fn register_candidate(
         risk: risk.into(),
         cleanable,
         requires_ack,
-        reason: reason.map(str::to_string),
-        cleanup_kind: if policy == Policy::Worktree {
-            Some("git".into())
-        } else {
-            None
-        },
+        reason: source_reason.or_else(|| reason.map(str::to_string)),
+        cleanup_kind: None,
         allocated_bytes: Some(fp.allocated_bytes),
     };
     snapshots.insert(
@@ -1264,7 +1376,6 @@ fn build_scan_mode(
         if policy != Policy::Sensitive && !discovered_path_is_allowlisted(&candidate.path, home) {
             continue;
         }
-        let old_len = items.len();
         register_candidate(
             candidate.category,
             policy,
@@ -1280,24 +1391,6 @@ fn build_scan_mode(
             extra_seconds,
             extra_entries,
         );
-        if is_worktree && items.len() > old_len {
-            let reason = match worktrees::inspect(&candidate.path) {
-                Ok(info) => info.reason,
-                Err(error) => Some(error),
-            };
-            if let Some(reason) = reason {
-                if let Some(item) = items.last_mut() {
-                    item.cleanable = false;
-                    item.risk = "protected".into();
-                    item.reason = Some(reason);
-                    if let Some(snapshot) = snapshots.get_mut(&item.id) {
-                        snapshot.cleanable = false;
-                    }
-                }
-            } else if let Some(item) = items.last_mut() {
-                item.reason = Some("Git will remove this clean worktree and retain its branch. It will not go to Trash.".into());
-            }
-        }
     }
     let report = ScanReport {
         coverage: ScanCoverage {
@@ -1366,9 +1459,7 @@ async fn pick_cleanup_folder(
         home_dir().ok_or_else(|| "Could not find the current user's home folder.".to_string())?;
     let path = fs::canonicalize(&selected_path)
         .map_err(|error| format!("Could not resolve the selected folder: {error}"))?;
-    if worktrees::contains_repository(&path) {
-        return Err("This folder contains a Git repository. Use Deep scan for linked worktrees, or choose a build-cache subfolder.".into());
-    }
+    source_guard::check(&path, known_generated_location(&path), false, false)?;
     if !manual_path_is_allowlisted(&path, &home) {
         return Err("Choose a folder inside your home folder or user temporary folder. Protected folders cannot be selected.".into());
     }
@@ -1397,6 +1488,7 @@ async fn pick_cleanup_folder(
     })
     .await
     .map_err(|_| "The selected folder could not be inspected.".to_string())??;
+    source_safety_check(&path, Policy::Manual, &fingerprint)?;
     if !manual_path_is_allowlisted(&path, &home) {
         return Err("The selected folder changed during inspection. Choose it again.".into());
     }
@@ -1470,7 +1562,7 @@ fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
     match policy {
         Policy::Discovered => discovered_path_is_allowlisted(path, home),
         Policy::Sensitive => false,
-        Policy::Worktree => path.starts_with(home) && path.join(".git").is_file(),
+        Policy::Worktree => false,
         Policy::Cache => cache_roots(home).iter().any(|(root, _)| {
             let Ok(relative) = path.strip_prefix(root) else {
                 return false;
@@ -1599,7 +1691,9 @@ fn active_process_reason(policy: Policy, active: &[String], hint: &str) -> Optio
     }
 }
 
-fn move_to_os_trash(path: &Path) -> Result<(), String> {
+fn move_to_os_trash(snapshot: &Snapshot) -> Result<(), String> {
+    source_safety_check(&snapshot.path, snapshot.policy, &snapshot.fingerprint)?;
+    let path = &snapshot.path;
     #[cfg(target_os = "macos")]
     {
         use trash::macos::{DeleteMethod, TrashContextExtMacos};
@@ -1679,22 +1773,10 @@ fn cleanup_selected(
             continue;
         };
         if snapshot.policy == Policy::Worktree {
-            let removed = if !acknowledge_risk {
-                Err("Confirm the Git worktree removal warning first.".into())
-            } else if !snapshot.cleanable || !policy_allows(&snapshot.path, home, snapshot.policy) {
-                Err("This worktree is protected or no longer available.".into())
-            } else {
-                worktrees::remove(&snapshot.path)
-            };
-            match removed {
-                Ok(()) => {
-                    result.trashed_ids.push(id);
-                    result.reclaimed_bytes = result
-                        .reclaimed_bytes
-                        .saturating_add(snapshot.fingerprint.bytes);
-                }
-                Err(message) => result.failures.push(CleanupFailure { id, message }),
-            }
+            result.failures.push(CleanupFailure {
+                id,
+                message: "Worktrees contain source code and are protected from cleanup.".into(),
+            });
             continue;
         }
         let active_reason =
@@ -1744,7 +1826,7 @@ fn cleanup_selected(
             });
             continue;
         }
-        match move_to_os_trash(&snapshot.path) {
+        match move_to_os_trash(snapshot) {
             Ok(()) => {
                 result.trashed_ids.push(id);
                 result.reclaimed_bytes = result
@@ -1892,6 +1974,14 @@ fn reveal_item(state: State<'_, AppState>, scan_id: String, item_id: String) -> 
 }
 
 #[tauri::command]
+async fn get_storage_capacity() -> Result<Volume, String> {
+    let home = home_dir().ok_or("Could not find your home folder.")?;
+    tauri::async_runtime::spawn_blocking(move || volume_info(&home))
+        .await
+        .map_err(|error| error.to_string())?
+}
+
+#[tauri::command]
 async fn get_system_insights() -> Result<insights::SystemInsights, String> {
     let home = home_dir().ok_or("Could not find your home folder.")?;
     tauri::async_runtime::spawn_blocking(move || insights::collect(&home))
@@ -1929,6 +2019,7 @@ pub fn run() {
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             scan_system,
+            get_storage_capacity,
             get_system_insights,
             open_system_settings,
             pick_cleanup_folder,
@@ -2460,6 +2551,179 @@ mod tests {
             measured.allocated_bytes,
             allocated_size(&fs::metadata(original)?)
         );
+        Ok(())
+    }
+
+    #[test]
+    fn manual_source_and_downloaded_source_are_protected_at_cleanup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = fs::canonicalize(tmp.path())?;
+        let project = home.join("Projects/unversioned");
+        fs::create_dir_all(project.join("src"))?;
+        fs::write(project.join("src/main.rs"), "fn main() {}")?;
+        let downloads = home.join("Downloads");
+        fs::create_dir(&downloads)?;
+        let source_file = downloads.join("project.py");
+        fs::write(&source_file, "print('keep')")?;
+        let script = downloads.join("run-project");
+        fs::write(&script, "#!/bin/sh\necho keep")?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))?;
+        }
+        for (path, policy) in [
+            (&project, Policy::Manual),
+            (&source_file, Policy::ReadOnly),
+            (&script, Policy::ReadOnly),
+        ] {
+            let snapshot = Snapshot {
+                path: path.clone(),
+                policy,
+                cleanable: true,
+                requires_ack: true,
+                guard_hint: "Source protection regression".into(),
+                fingerprint: fingerprint(path).map_err(std::io::Error::other)?,
+            };
+            let result = cleanup_selected(
+                &home,
+                vec!["source".into()],
+                vec![("source".into(), snapshot)],
+                true,
+            );
+            assert!(result.trashed_ids.is_empty());
+            assert_eq!(result.failures.len(), 1);
+            assert!(result.failures[0].message.contains("protected"));
+            assert!(path.exists());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn generated_cache_is_allowed_but_nested_repo_and_worktree_are_not()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = fs::canonicalize(tmp.path())?;
+        let target = home.join("Projects/app/target");
+        fs::create_dir_all(&target)?;
+        fs::write(target.join("CACHEDIR.TAG"), "generated")?;
+        fs::write(target.join("generated.rs"), "generated source")?;
+        let fp = fingerprint(&target).map_err(std::io::Error::other)?;
+        assert!(fp.contains_source_code);
+        assert!(source_safety_check(&target, Policy::Manual, &fp).is_ok());
+        fs::create_dir_all(target.join("nested/.git"))?;
+        let fp = fingerprint(&target).map_err(std::io::Error::other)?;
+        assert!(fp.contains_repository);
+        assert!(source_safety_check(&target, Policy::Manual, &fp).is_err());
+        let snapshot = Snapshot {
+            path: target.clone(),
+            policy: Policy::Worktree,
+            cleanable: true,
+            requires_ack: true,
+            guard_hint: "Worktree".into(),
+            fingerprint: fp,
+        };
+        let result = cleanup_selected(
+            &home,
+            vec!["worktree".into()],
+            vec![("worktree".into(), snapshot)],
+            true,
+        );
+        assert!(result.trashed_ids.is_empty());
+        assert!(target.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn source_added_after_selection_prevents_removal() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = fs::canonicalize(tmp.path())?;
+        let folder = home.join("Downloads/photos");
+        fs::create_dir_all(&folder)?;
+        fs::write(folder.join("picture.png"), "image")?;
+        let snapshot = Snapshot {
+            path: folder.clone(),
+            policy: Policy::Manual,
+            cleanable: true,
+            requires_ack: true,
+            guard_hint: "Photos".into(),
+            fingerprint: fingerprint(&folder).map_err(std::io::Error::other)?,
+        };
+        fs::write(folder.join("program.ts"), "export const keep = true")?;
+        let result = cleanup_selected(
+            &home,
+            vec!["changed".into()],
+            vec![("changed".into(), snapshot)],
+            true,
+        );
+        assert!(result.trashed_ids.is_empty());
+        assert!(folder.join("program.ts").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn source_candidates_are_not_selectable_and_newly_tracked_cache_is_kept()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let Some(git) = worktrees::git_binary() else {
+            return Ok(());
+        };
+        let tmp = TempDir::new()?;
+        let home = fs::canonicalize(tmp.path())?;
+        let repo = home.join("Projects/app");
+        let target = repo.join("target");
+        fs::create_dir_all(&target)?;
+        fs::write(repo.join("Cargo.toml"), "[package]")?;
+        fs::write(target.join("CACHEDIR.TAG"), "generated")?;
+        fs::write(target.join("generated.rs"), "generated source")?;
+        let status = std::process::Command::new(git)
+            .args(["init", "-q"])
+            .arg(&repo)
+            .status()?;
+        assert!(status.success());
+        let mut items = Vec::new();
+        let mut snapshots = HashMap::new();
+        register_candidate(
+            "developer",
+            Policy::Manual,
+            repo.clone(),
+            "Project".into(),
+            "Added by you".into(),
+            &[],
+            Instant::now(),
+            &mut 0,
+            &mut items,
+            &mut snapshots,
+            &mut Vec::new(),
+            MAX_SCAN_SECONDS,
+            MAX_VISITED,
+        );
+        assert_eq!(items.len(), 1);
+        assert!(!items[0].cleanable);
+        assert_eq!(items[0].risk, "protected");
+        let snapshot = Snapshot {
+            path: target.clone(),
+            policy: Policy::Manual,
+            cleanable: true,
+            requires_ack: true,
+            guard_hint: "Build cache".into(),
+            fingerprint: fingerprint(&target).map_err(std::io::Error::other)?,
+        };
+        assert!(source_safety_check(&target, Policy::Manual, &snapshot.fingerprint).is_ok());
+        let status = std::process::Command::new(git)
+            .arg("-C")
+            .arg(&repo)
+            .args(["add", "-f", "target/generated.rs"])
+            .status()?;
+        assert!(status.success());
+        let result = cleanup_selected(
+            &home,
+            vec!["cache".into()],
+            vec![("cache".into(), snapshot)],
+            true,
+        );
+        assert!(result.trashed_ids.is_empty());
+        assert!(result.failures[0].message.contains("tracked"));
+        assert!(target.join("generated.rs").exists());
         Ok(())
     }
 

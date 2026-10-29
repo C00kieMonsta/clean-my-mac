@@ -8,6 +8,7 @@ import {
   vi,
 } from "vitest";
 import {
+  act,
   cleanup,
   fireEvent,
   render,
@@ -20,6 +21,7 @@ import type { CleanupResult, ScanItem, ScanReport } from "@clean-my-mac/core";
 
 const bridge = vi.hoisted(() => ({
   scanSystem: vi.fn(),
+  storageCapacity: vi.fn(),
   pickCleanupFolder: vi.fn(),
   trashItems: vi.fn(),
   revealItem: vi.fn(),
@@ -30,6 +32,7 @@ const bridge = vi.hoisted(() => ({
 vi.mock("./lib/bridge", () => ({
   previewMode: false,
   scanSystem: bridge.scanSystem,
+  storageCapacity: bridge.storageCapacity,
   pickCleanupFolder: bridge.pickCleanupFolder,
   trashItems: bridge.trashItems,
   revealItem: bridge.revealItem,
@@ -159,6 +162,7 @@ beforeAll(() => {
 beforeEach(() => {
   vi.clearAllMocks();
   bridge.scanSystem.mockResolvedValue(report);
+  bridge.storageCapacity.mockResolvedValue(report.volume);
   bridge.pickCleanupFolder.mockResolvedValue(null);
   bridge.trashItems.mockResolvedValue({
     trashedIds: [],
@@ -173,6 +177,40 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Clean My Mac cleanup review", () => {
+  it("uses macOS available space for the used total and keeps scan size separate", async () => {
+    bridge.scanSystem.mockResolvedValue({
+      ...report,
+      volume: {
+        name: "Macintosh HD",
+        totalBytes: 994_662_584_320,
+        freeBytes: 34_584_285_184,
+        availableBytes: 445_293_320_683,
+        availableForImportantUsageBytes: 445_293_320_683,
+        purgeableBytes: 410_709_035_499,
+      },
+    });
+    render(<App />);
+    const storage = await screen.findByRole("region", { name: "Disk storage" });
+    expect(within(storage).getByText("549.4 GB")).toBeInTheDocument();
+    expect(within(storage).getByText("445.3 GB available")).toBeInTheDocument();
+    expect(within(storage).getByText(/Includes 34.6 GB free on disk and 410.7 GB reclaimable by macOS/)).toBeInTheDocument();
+    expect(within(storage).getByText(/partial scan, not a disk breakdown/i)).toBeInTheDocument();
+    expect(within(storage).queryByText(/Scanned files/)).not.toBeInTheDocument();
+  });
+
+  it("refreshes capacity without rescanning file locations", async () => {
+    vi.useFakeTimers();
+    try {
+      render(<App />);
+      await act(async () => { await Promise.resolve(); });
+      await act(async () => { await vi.advanceTimersByTimeAsync(30_000); });
+      expect(bridge.storageCapacity).toHaveBeenCalledTimes(1);
+      expect(bridge.scanSystem).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("requests a deep scan and shows its coverage", async () => {
     bridge.scanSystem.mockResolvedValue({ ...report, coverage: { mode: "deep", detectors: 44, visitedEntries: 1200, elapsedMs: 3400 } });
     render(<App />);
@@ -570,7 +608,8 @@ describe("Clean My Mac cleanup review", () => {
       screen.getByRole("checkbox", { name: "Select Old agent conversation" }),
     ).toBeEnabled();
     navigateTo("Overview");
-    expect(screen.getByText("270 GB free")).toBeInTheDocument();
+    expect(screen.getByText("270 GB available")).toBeInTheDocument();
+    expect(screen.getByText(/Includes 270 GB free on disk and 0 B reclaimable by macOS/)).toBeInTheDocument();
     expect(bridge.scanSystem).toHaveBeenCalledTimes(1);
     fireEvent.click(
       screen.getByRole("button", {

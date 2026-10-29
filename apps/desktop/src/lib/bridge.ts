@@ -10,6 +10,11 @@ export async function scanSystem(deep = false): Promise<ScanReport> {
   return invoke<ScanReport>("scan_system", { deep });
 }
 
+export async function storageCapacity(): Promise<ScanReport["volume"]> {
+  if (previewMode) return structuredClone(demoReport.volume);
+  return invoke<ScanReport["volume"]>("get_storage_capacity");
+}
+
 export async function systemInsights(): Promise<SystemInsights> {
   if (previewMode) return structuredClone(demoInsights);
   return invoke<SystemInsights>("get_system_insights");

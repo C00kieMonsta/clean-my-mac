@@ -87,9 +87,21 @@ pub(crate) struct OpenFileInfo {
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct StorageCapacity {
+    pub(crate) total_bytes: u64,
     pub(crate) free_bytes: u64,
     pub(crate) available_for_important_usage_bytes: u64,
     pub(crate) purgeable_bytes: u64,
+}
+
+pub(crate) fn normalize_capacity(total: u64, free: u64, available: u64) -> StorageCapacity {
+    let free = free.min(total);
+    let available = available.min(total).max(free);
+    StorageCapacity {
+        total_bytes: total,
+        free_bytes: free,
+        available_for_important_usage_bytes: available,
+        purgeable_bytes: available - free,
+    }
 }
 
 struct CommandOutput {
@@ -614,11 +626,7 @@ pub(crate) fn storage_capacity(home: &Path) -> Option<StorageCapacity> {
     let free_bytes = number(free_key)?;
     let important = number(important_key)?;
     let total = number(total_key)?;
-    Some(StorageCapacity {
-        free_bytes,
-        available_for_important_usage_bytes: important,
-        purgeable_bytes: important.saturating_sub(free_bytes).min(total),
-    })
+    Some(normalize_capacity(total, free_bytes, important))
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -630,6 +638,29 @@ pub(crate) fn storage_capacity(_home: &Path) -> Option<StorageCapacity> {
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn available_capacity_includes_reclaimable_space_and_stays_consistent() {
+        let capacity = normalize_capacity(994_662_584_320, 34_584_285_184, 445_293_320_683);
+        assert_eq!(
+            capacity.total_bytes - capacity.available_for_important_usage_bytes,
+            549_369_263_637
+        );
+        assert_eq!(capacity.purgeable_bytes, 410_709_035_499);
+        assert_eq!(
+            capacity.free_bytes + capacity.purgeable_bytes,
+            capacity.available_for_important_usage_bytes
+        );
+        let bounded = normalize_capacity(100, 20, 200);
+        assert_eq!(bounded.available_for_important_usage_bytes, 100);
+        assert_eq!(bounded.purgeable_bytes, 80);
+        let inconsistent = normalize_capacity(100, 50, 20);
+        assert_eq!(inconsistent.available_for_important_usage_bytes, 50);
+        assert_eq!(inconsistent.purgeable_bytes, 0);
+        assert_eq!(normalize_capacity(0, 10, 20).free_bytes, 0);
+        let fallback = normalize_capacity(100, 25, 25);
+        assert_eq!(fallback.purgeable_bytes, 0);
+    }
 
     #[test]
     fn parses_time_machine_snapshot_names() {

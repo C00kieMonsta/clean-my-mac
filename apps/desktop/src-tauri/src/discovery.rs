@@ -389,6 +389,12 @@ fn named_roots(home: &Path) -> Vec<(PathBuf, &'static str, &'static str, &'stati
     roots
 }
 
+pub(crate) fn is_known_cache(path: &Path, home: &Path) -> bool {
+    named_roots(home)
+        .into_iter()
+        .any(|(root, _, _, _, handling)| handling == Handling::Cache && path.starts_with(root))
+}
+
 fn browser_cache_roots(home: &Path) -> Vec<Candidate> {
     let mut found = Vec::new();
     for (base, browser) in [
@@ -689,8 +695,8 @@ fn detect_project_artifact(scan: &mut Scan<'_>, path: &Path, name: &str) {
                     path.to_path_buf(),
                     category,
                     "Project dependency directory",
-                    "Vendored project dependencies. Review before clearing because projects may store source files here",
-                    Handling::Developer,
+                    "Vendored dependencies may contain maintained source code. This folder is protected",
+                    Handling::Sensitive,
                 );
             }
         }

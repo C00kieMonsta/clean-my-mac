@@ -412,16 +412,11 @@ h1 {
   display: flex;
   background: #3b3c43;
   border: 1px solid #48494f;
-  gap: 2px;
 }
 .storage-used {
   height: 100%;
+  flex: 0 0 auto;
   background: linear-gradient(90deg, #797484, #9b93a9);
-}
-.storage-scanned {
-  height: 100%;
-  background: #c8b7f4;
-  min-width: 0;
 }
 .storage-legend {
   display: flex;
@@ -454,8 +449,7 @@ h1 {
   background: #c8b7f4;
 }
 .dot.available {
-  background: #4b4c54;
-  border: 1px solid #666774;
+  background: #c8b7f4;
 }
 .stats-grid {
   display: grid;

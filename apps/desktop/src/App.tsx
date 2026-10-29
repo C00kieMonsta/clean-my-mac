@@ -31,6 +31,7 @@ import {
   eligibleItems,
   formatBytes,
   selectedItems,
+  storageUsage,
   totalBytes,
   type Category,
   type ScanItem,
@@ -42,6 +43,7 @@ import {
   previewMode,
   revealItem,
   scanSystem,
+  storageCapacity,
   systemInsights,
   openSystemSettings,
   trashItems,
@@ -129,7 +131,6 @@ export default function App() {
   const [insightsBusy, setInsightsBusy] = useState(false);
   const [insightsError, setInsightsError] = useState<string | null>(null);
   const [lastCleanup, setLastCleanup] = useState<string | null>(null);
-  const [lastCleanupWasGit, setLastCleanupWasGit] = useState(false);
   const [lastCleanupHadFailures, setLastCleanupHadFailures] = useState(false);
   const [modal, setModal] = useState<"cleanup" | "help" | "receipt" | null>(
     null,
@@ -147,26 +148,13 @@ export default function App() {
   const needsRiskAcknowledgement = chosen.some(
     (item) => item.requiresAck ?? item.risk !== "safe",
   );
-  const hasGit = chosen.some((item) => item.cleanupKind === "git");
-  const gitCount = chosen.filter((item) => item.cleanupKind === "git").length;
-  const trashCount = chosen.length - gitCount;
-  const receiptGitCount = movedItems.filter((item) => item.cleanupKind === "git").length;
-  const receiptTrashCount = movedItems.length - receiptGitCount;
   const recommended = eligible.filter((item) => item.risk === "safe");
   const reclaimable = totalBytes(eligible);
-  const usedBytes = report
-    ? Math.max(0, report.volume.totalBytes - (report.volume.freeBytes ?? report.volume.availableBytes))
-    : 0;
+  const storage = report ? storageUsage(report.volume) : null;
+  const usedBytes = storage?.usedBytes ?? 0;
   const usedPercent =
-    report && report.volume.totalBytes > 0
-      ? Math.min(100, (usedBytes / report.volume.totalBytes) * 100)
-      : 0;
-  const knownPercent =
-    report && report.volume.totalBytes > 0
-      ? Math.min(
-          usedPercent,
-          (totalBytes(items) / report.volume.totalBytes) * 100,
-        )
+    storage && storage.totalBytes > 0
+      ? Math.min(100, (usedBytes / storage.totalBytes) * 100)
       : 0;
 
   async function scan(deep = deepScan) {
@@ -255,6 +243,23 @@ export default function App() {
   useEffect(() => {
     void scan();
   }, []);
+  useEffect(() => {
+    if (!report || previewMode) return;
+    const reportId = report.id;
+    let cancelled = false;
+    const timer = window.setInterval(() => {
+      void storageCapacity().then((volume) => {
+        if (cancelled) return;
+        setReport((current) => current?.id === reportId ? { ...current, volume } : current);
+      }).catch(() => {
+        // Keep the last known capacity if the read-only refresh fails.
+      });
+    }, 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [report?.id]);
   useEffect(() => {
     if (modal !== "cleanup") setRiskAcknowledged(false);
   }, [modal]);
@@ -374,9 +379,6 @@ export default function App() {
       );
       const removed = new Set(result.trashedIds);
       const completedItems = chosen.filter((item) => removed.has(item.id));
-      const completedGitCount = completedItems.filter((item) => item.cleanupKind === "git").length;
-      const completedTrashItems = completedItems.filter((item) => item.cleanupKind !== "git");
-      const completedTrashCount = completedTrashItems.length;
       setMovedItems(completedItems);
       setReport((previous) =>
         previous
@@ -387,6 +389,8 @@ export default function App() {
                 ...previous.volume,
                 freeBytes: result.freeBytesAfter,
                 availableBytes: result.freeBytesAfter,
+                availableForImportantUsageBytes: result.freeBytesAfter,
+                purgeableBytes: 0,
               }),
             }
           : previous,
@@ -394,17 +398,14 @@ export default function App() {
       setSelected(new Set());
       setRiskAcknowledged(false);
       setModal(null);
-      const movedBytes = result.movedBytes ?? totalBytes(completedTrashItems);
+      const movedBytes = result.movedBytes ?? totalBytes(completedItems);
       let summary = completedItems.length === 0
         ? "No selected items were cleaned."
-        : `${completedItems.length} item${completedItems.length === 1 ? "" : "s"} ${completedGitCount && completedTrashCount ? "cleaned" : completedGitCount ? "cleaned through Git" : "moved to Trash"}.`;
-      if (completedGitCount && completedTrashCount) summary = `${completedGitCount} worktree${completedGitCount === 1 ? "" : "s"} cleaned through Git and ${completedTrashCount} item${completedTrashCount === 1 ? "" : "s"} moved to Trash.`;
-      if (completedGitCount) summary += " Git worktree branches are preserved, but their files cannot be restored from Trash.";
-      if (completedTrashCount) summary += ` Moved data: ${formatBytes(movedBytes)}. Trash items still occupy disk space until Trash is emptied.`;
-      if (result.freeBytesBefore != null && result.freeBytesAfter != null) summary += ` Free space: ${formatBytes(result.freeBytesBefore)} before, ${formatBytes(result.freeBytesAfter)} after.`;
+        : `${completedItems.length} item${completedItems.length === 1 ? "" : "s"} moved to Trash.`;
+      if (completedItems.length) summary += ` Moved data: ${formatBytes(movedBytes)}. Trash items still occupy disk space until Trash is emptied.`;
+      if (result.freeBytesBefore != null && result.freeBytesAfter != null) summary += ` Free on disk: ${formatBytes(result.freeBytesBefore)} before, ${formatBytes(result.freeBytesAfter)} after.`;
       if (result.failures.length) summary += ` ${result.failures.length} item(s) were kept: ${result.failures.map((failure) => failure.message).join(" ")}`;
       setLastCleanup(summary);
-      setLastCleanupWasGit(completedGitCount > 0 && completedTrashCount === 0);
       setLastCleanupHadFailures(result.failures.length > 0);
       setNotice({
         text: summary,
@@ -501,7 +502,7 @@ export default function App() {
             <ChevronRight size={14} />
           </button>
           <div className="version">
-            Clean My Mac <span>v0.2.1</span>
+            Clean My Mac <span>v0.2.3</span>
           </div>
         </div>
       </aside>
@@ -568,7 +569,7 @@ export default function App() {
               <Info size={17} />
               <span>
                 {notice.text}
-                {lastCleanup && notice.text === lastCleanup && !lastCleanupWasGit && <button className="text-button" onClick={() => void settings("trash")}>Open Trash in Finder <ArrowRight size={13}/></button>}
+                {lastCleanup && notice.text === lastCleanup && <button className="text-button" onClick={() => void settings("trash")}>Open Trash in Finder <ArrowRight size={13}/></button>}
                 {movedItems.length > 0 && (
                   <button
                     className="text-button"
@@ -588,7 +589,7 @@ export default function App() {
               </button>
             </div>
           )}
-          {lastCleanup && !notice && <div role={lastCleanupHadFailures ? "alert" : "status"} className={`notice ${lastCleanupHadFailures ? "error" : "success"} persistent-cleanup`}><Info size={17}/><span>Last cleanup: {lastCleanup}{!lastCleanupWasGit && <button className="text-button" onClick={() => void settings("trash")}>Open Trash in Finder <ArrowRight size={13}/></button>}{movedItems.length > 0 && <button className="text-button" onClick={() => setModal("receipt")}>View moved files and original locations <ArrowRight size={13}/></button>}</span></div>}
+          {lastCleanup && !notice && <div role={lastCleanupHadFailures ? "alert" : "status"} className={`notice ${lastCleanupHadFailures ? "error" : "success"} persistent-cleanup`}><Info size={17}/><span>Last cleanup: {lastCleanup}<button className="text-button" onClick={() => void settings("trash")}>Open Trash in Finder <ArrowRight size={13}/></button>{movedItems.length > 0 && <button className="text-button" onClick={() => setModal("receipt")}>View moved files and original locations <ArrowRight size={13}/></button>}</span></div>}
 
             {view === "overview" && (
             <>
@@ -627,34 +628,23 @@ export default function App() {
                 >
                   <span
                     className="storage-used"
-                    style={{
-                      width: `${Math.max(0, usedPercent - knownPercent)}%`,
-                    }}
-                  />
-                  <span
-                    className="storage-scanned"
-                    style={{ width: `${knownPercent}%` }}
+                    style={{ width: `${usedPercent}%` }}
                   />
                 </div>
                 <div className="storage-legend">
                   <span>
                     <i className="dot other" />
-                    Other used space
-                  </span>
-                  <span>
-                    <i className="dot purple" />
-                    Scanned files
-                    {report && ` · ${formatBytes(totalBytes(items))}`}
+                    Used
                   </span>
                   <span className="available-legend">
                     <i className="dot available" />
                     {report
-                      ? `${formatBytes(report.volume.freeBytes ?? report.volume.availableBytes)} free`
+                      ? `${formatBytes(storage?.availableBytes ?? 0)} available`
                       : "Calculating…"}
                   </span>
                 </div>
-                {report?.volume.purgeableBytes != null && <p className="storage-context">{formatBytes(report.volume.purgeableBytes)} potentially reclaimable. macOS may keep this space until needed.</p>}
-                {report?.volume.availableForImportantUsageBytes != null && <p className="storage-context">macOS reports {formatBytes(report.volume.availableForImportantUsageBytes)} available for important use. This includes reclaimable space and differs from free space.</p>}
+                {report && <p className="storage-context">Includes {formatBytes(storage?.freeBytes ?? 0)} free on disk and {formatBytes(storage?.purgeableBytes ?? 0)} reclaimable by macOS.</p>}
+                {report && <p className="storage-context">The scan found {formatBytes(totalBytes(items))} across scanned locations. This is a partial scan, not a disk breakdown.</p>}
               </section>
               <section className="stats-grid" aria-label="Scan summary">
                 <button
@@ -1073,7 +1063,7 @@ export default function App() {
                 model download caches, Xcode files, package caches, project
                 artifacts, and large Downloads. A deep scan checks more known
                 locations and bounded project folders. You can also add a folder manually. Its contents
-                will move together if you confirm cleanup.
+              are checked for recognized source and project markers. Recognized source folders, Git worktrees, repositories, and tracked project files stay protected. Verified generated caches can be selected when they contain no tracked source. Checks run again before moving items to Trash, including a check that contents have not changed since scanning. Unrecognized source formats may not be detected, so review every path before cleanup.
               </p>
             </li>
             <li><strong>Understand system findings</strong><p>System insights can list local backup snapshots, background services with missing programs, processes using memory, and deleted files still held open. These are context only. They are not removed or stopped.</p></li>
@@ -1133,11 +1123,10 @@ export default function App() {
             <div>
               <strong>{formatBytes(chosenBytes)}</strong>
               <p>
-                {hasGit && trashCount ? `${gitCount} worktree${gitCount === 1 ? "" : "s"} will be cleaned through Git and ${trashCount} item${trashCount === 1 ? "" : "s"} will move to Trash` : `${chosen.length.toLocaleString()} item${chosen.length === 1 ? "" : "s"} ${hasGit ? "will be cleaned through Git" : "will move to Trash"}`}
+                {`${chosen.length.toLocaleString()} item${chosen.length === 1 ? "" : "s"} will move to Trash`}
               </p>
             </div>
           </div>
-          {hasGit && <div className="help-note caution"><Info size={17}/><p>Removing a Git worktree deletes its working files through Git and preserves its branch. This does not go to Trash and cannot be restored from Trash.</p></div>}
           {chosen.some((item) => item.category === "agents") && (
             <div className="help-note caution">
               <Info size={17} />
@@ -1184,7 +1173,7 @@ export default function App() {
                 }
               />
               <span>
-                {hasGit ? "I understand Git worktree cleanup permanently removes the selected working files, while preserving the branch." : "I understand these files may be in use, contain history I need, or include personal data."}
+                I understand these files may be in use, contain history I need, or include personal data.
               </span>
             </label>
           )}
@@ -1216,7 +1205,7 @@ export default function App() {
               ) : (
                 <Trash2 size={16} />
               )}
-              {cleaning ? (hasGit ? "Cleaning…" : "Moving to Trash…") : (hasGit ? "Confirm cleanup" : "Move to Trash")}
+              {cleaning ? "Moving to Trash…" : "Move to Trash"}
             </button>
           </div>
         </Modal>
@@ -1224,8 +1213,7 @@ export default function App() {
       {modal === "receipt" && (
         <Modal title="Your last cleanup" close={() => setModal(null)}>
           <p className="modal-caption">
-            {receiptGitCount > 0 && `${receiptGitCount} worktree${receiptGitCount === 1 ? " was" : "s were"} removed through Git. Its branch${receiptGitCount === 1 ? " remains" : "es remain"}; those files cannot be restored from Trash. `}
-            {receiptTrashCount > 0 && `${receiptTrashCount} item${receiptTrashCount === 1 ? " was" : "s were"} moved to Trash. To restore one, drag it from Trash to its original folder. `}
+            {movedItems.length > 0 && `${movedItems.length} item${movedItems.length === 1 ? " was" : "s were"} moved to Trash. To restore one, drag it from Trash to its original folder. `}
             This list is available until you close the app or complete another cleanup.
           </p>
           <div className="review-list receipt-list">
