@@ -65,7 +65,7 @@ const report: ScanReport = {
       modifiedAt: 1_799_000_000_000,
       description: "A recent session.",
       source: "Codex",
-      risk: "protected",
+      risk: "review",
       cleanable: true,
     },
     {
@@ -92,8 +92,21 @@ const report: ScanReport = {
       description: "A large personal download.",
       source: "Downloads",
       risk: "review",
-      cleanable: false,
-      reason: "Manage this file in Finder.",
+      cleanable: true,
+      reason: "Review this download before clearing.",
+    },
+    {
+      id: "protected-config",
+      category: "developer",
+      name: "Protected configuration",
+      path: "~/Library/Application Support/app/config.json",
+      bytes: 1_000_000,
+      fileCount: 1,
+      modifiedAt: 1_700_000_000_000,
+      description: "Configuration used by an app.",
+      source: "App",
+      risk: "protected",
+      cleanable: true,
     },
   ],
   warnings: [],
@@ -131,7 +144,7 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("Clean My Mac cleanup review", () => {
-  it("keeps protected and Finder-only entries unselectable", async () => {
+  it("allows manual review of recent files and downloads, while protected files stay unselectable", async () => {
     render(<App />);
     await screen.findByText("Macintosh HD");
 
@@ -139,17 +152,44 @@ describe("Clean My Mac cleanup review", () => {
     const recent = await screen.findByRole("checkbox", {
       name: "Select Recent agent conversation",
     });
-    expect(recent).toBeDisabled();
+    expect(recent).toBeEnabled();
+    fireEvent.click(recent);
+    expect(recent).toBeChecked();
 
     navigateTo("Large files");
     const download = await screen.findByRole("checkbox", {
       name: "Select Personal installer.dmg",
     });
-    expect(download).toBeDisabled();
+    expect(download).toBeEnabled();
+    fireEvent.click(download);
+    navigateTo("Developer files");
     expect(
-      screen.getByRole("button", { name: "Review cleanup" }),
+      await screen.findByRole("checkbox", {
+        name: "Select Protected configuration",
+      }),
     ).toBeDisabled();
-    expect(bridge.trashItems).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
+    const dialog = await screen.findByRole("dialog", {
+      name: "Review your cleanup",
+    });
+    const moveButton = within(dialog).getByRole("button", {
+      name: "Move to Trash",
+    });
+    expect(moveButton).toBeDisabled();
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "I understand these files may be in use or contain history I need.",
+      }),
+    );
+    expect(moveButton).toBeEnabled();
+    fireEvent.click(moveButton);
+    await waitFor(() =>
+      expect(bridge.trashItems).toHaveBeenCalledWith(
+        "scan-123",
+        ["session-recent", "download-large"],
+        true,
+      ),
+    );
   });
 
   it("selects recommended cache items without auto-selecting session history", async () => {
@@ -195,7 +235,11 @@ describe("Clean My Mac cleanup review", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
     await waitFor(() =>
-      expect(bridge.trashItems).toHaveBeenCalledWith("scan-123", ["cache-old"]),
+      expect(bridge.trashItems).toHaveBeenCalledWith(
+        "scan-123",
+        ["cache-old"],
+        false,
+      ),
     );
   });
 
@@ -225,6 +269,11 @@ describe("Clean My Mac cleanup review", () => {
     );
     fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
     fireEvent.click(
+      await screen.findByRole("checkbox", {
+        name: "I understand these files may be in use or contain history I need.",
+      }),
+    );
+    fireEvent.click(
       await screen.findByRole("button", { name: "Move to Trash" }),
     );
 
@@ -232,7 +281,7 @@ describe("Clean My Mac cleanup review", () => {
       expect(bridge.trashItems).toHaveBeenCalledWith("scan-123", [
         "session-old",
         "cache-old",
-      ]),
+      ], true),
     );
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "1 item moved to Trash",
@@ -311,6 +360,7 @@ describe("Clean My Mac cleanup review", () => {
     await waitFor(() => expect(bridge.trashItems).toHaveBeenCalledTimes(1));
     const ids = bridge.trashItems.mock.calls[0]?.[1] as string[];
     expect(bridge.trashItems.mock.calls[0]?.[0]).toBe("scan-123");
+    expect(bridge.trashItems.mock.calls[0]?.[2]).toBe(false);
     expect(ids).toHaveLength(200);
     expect(ids).toEqual(
       Array.from({ length: 200 }, (_, index) => `cache-${index}`),

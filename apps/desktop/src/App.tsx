@@ -940,6 +940,7 @@ export default function App() {
             <label className="risk-acknowledgement">
               <input
                 type="checkbox"
+                className="checkbox"
                 checked={riskAcknowledged}
                 onChange={(event) =>
                   setRiskAcknowledged(event.currentTarget.checked)

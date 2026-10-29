@@ -4,23 +4,23 @@ Clean My Mac is a local storage tool. The app reads metadata from a small allowl
 
 ## What a scan can inspect
 
-The scanner looks for stale coding-agent session records, old caches and logs, selected rebuildable developer data, and large files in Downloads. It does not index all of Macintosh HD. Downloads results are review-only, since a large file may hold important work.
+The scanner checks known coding-agent history, caches and logs, selected developer data, and large files directly in Downloads. It does not scan all of Macintosh HD. Older inactive caches can be recommended. Recent or in-use histories and caches, Hugging Face model files, and Downloads files can be selected manually after an explicit risk acknowledgement.
 
 | Category | Locations |
 | --- | --- |
 | Agent transcripts | JSONL files under `~/.codex/sessions`, `~/.codex/archived_sessions`, and `~/.claude/projects` |
-| Caches | Known Xcode, Homebrew, npm, pnpm, Yarn, pip, uv, Playwright, and Cypress folders under `~/Library/Caches`; `~/.npm/_cacache`; `~/.cache/Homebrew` |
+| Caches | Named folders under `~/Library/Caches`: `com.apple.dt.Xcode`, `Homebrew`, `npm`, `pnpm`, `yarn`, `pip`, `uv`, `playwright`, `ms-playwright`, `Cypress`, `CocoaPods`, `com.spotify.client`, and `com.microsoft.VSCode.ShipIt`; `~/.npm/_cacache`; `~/.cache/Homebrew`, `~/.cache/uv`, `~/.cache/puppeteer`, `~/.cache/pre-commit`, and `~/.cache/huggingface/hub`; `~/Library/Application Support/Spotify/PersistentCache`; `~/Library/Application Support/stremio-server/stremio-cache`; `~/Library/iTunes/iPhone Software Updates` |
 | Logs | `~/Library/Logs/DiagnosticReports` |
 | Developer files | Children of `~/Library/Developer/Xcode/DerivedData` |
-| Large files | Files of at least 512 MiB directly inside `~/Downloads`, for Finder review only |
+| Large files | Files of at least 512 MiB directly inside `~/Downloads` |
 
-Agent session data can contain prompts, tool output, or source code. The app shows a path and a short cleanup reason so the user can decide whether to keep it. Current sessions stay protected, and recent history stays protected until it is at least 30 days old. The app excludes agent preferences, authentication files, API keys, and other configuration. It does not inspect or copy file contents for display.
+Agent session data can contain prompts, tool output, or source code. The app shows a path and a short cleanup reason so the user can decide whether to keep it. Older inactive histories may be recommended. Recent or active histories can be selected manually after the risk acknowledgement. The app does not scan agent preferences, authentication files, API keys, or other configuration. It does not inspect or copy file contents for display. Hugging Face model cache entries always require review because removing them may make models unavailable offline. `~/.cache/huggingface/lerobot` is not scanned.
 
 ## Cleanup
 
-A scan does not alter files. The user selects cleanable entries and confirms before cleanup. Clean My Mac asks macOS to move those entries to Trash. It does not permanently unlink files or use administrator access. A file that is still active, has changed since the scan, sits outside an approved directory, or cannot safely be moved is skipped and shown as a failure.
+A scan does not alter files. The user selects eligible entries and confirms before cleanup. Items marked for review require an explicit acknowledgement before Clean My Mac asks macOS to move them to Trash. This includes recent or in-use histories and caches, Hugging Face model files, and direct Downloads files. The app does not permanently unlink files or use administrator access. A path that changed since the scan, is a symbolic link, falls outside a known root, or cannot safely be moved is rejected or skipped and shown as a failure.
 
-Each scan is limited to 12 seconds and 5,000 findings. Agent traversal has separate limits of 5 seconds, 30,000 visited entries, and 1,500 findings. Other categories can visit up to 100,000 entries within the remaining time. It skips symbolic links, reports unreadable locations as warnings, and may return partial results when it reaches a limit. System locations, application bundles, personal libraries, and agent credentials are outside its cleanup allowlist.
+Each scan is limited to 30 seconds, 500,000 visited entries, and 5,000 findings. Agent traversal has separate limits of 5 seconds, 30,000 visited entries, and 1,500 findings. It skips symbolic links, reports unreadable locations as warnings, and may return partial results when it reaches a limit. Unlisted personal data, system locations, application bundles, settings, and credentials are outside its cleanup allowlist.
 
 ## Restoring items
 
@@ -28,4 +28,4 @@ Cleanup moves selected items into the macOS Trash. Finder's Put Back option may 
 
 These safeguards reduce accidental loss. A user should review the displayed names and sizes before confirming, especially for agent records that may contain useful context.
 
-Session cleanup removes transcript files only. Agent databases and workspace indexes stay intact, so an agent may still list a removed conversation. Closing an agent and scanning again is required before its eligible transcripts can be selected.
+Session cleanup removes transcript files only. Agent databases and workspace indexes stay intact, so an agent may still list a removed conversation until its own index refreshes.

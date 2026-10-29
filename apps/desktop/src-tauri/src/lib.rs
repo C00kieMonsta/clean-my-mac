@@ -16,8 +16,8 @@ const DAY: u64 = 86_400;
 const CACHE_MIN_AGE: u64 = 7 * DAY;
 const SESSION_MIN_AGE: u64 = 30 * DAY;
 const LARGE_FILE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_SCAN_SECONDS: u64 = 12;
-const MAX_VISITED: usize = 100_000;
+const MAX_SCAN_SECONDS: u64 = 30;
+const MAX_VISITED: usize = 500_000;
 const MAX_SCAN_ITEMS: usize = 5_000;
 const MAX_AGENT_ITEMS: usize = 1_500;
 const MAX_AGENT_VISITED: usize = 30_000;
@@ -278,6 +278,29 @@ fn no_symlink_path(path: &Path, home: &Path) -> bool {
 
 fn cache_roots(home: &Path) -> Vec<(PathBuf, String)> {
     let caches = home.join("Library/Caches");
+    let mut roots = vec![
+        (
+            home.join("Library/Application Support/Spotify/PersistentCache"),
+            "Spotify persistent cache".into(),
+        ),
+        (
+            home.join("Library/Application Support/stremio-server/stremio-cache"),
+            "Stremio server cache".into(),
+        ),
+        (
+            home.join("Library/iTunes/iPhone Software Updates"),
+            "iPhone software update files".into(),
+        ),
+        (
+            home.join(".cache/huggingface/hub"),
+            "Hugging Face downloaded model cache. Removing it may make models unavailable offline."
+                .into(),
+        ),
+        (
+            home.join(".cache/puppeteer"),
+            "Puppeteer browser download cache".into(),
+        ),
+    ];
     let recognized = [
         ("com.apple.dt.Xcode", "Xcode cache files"),
         ("Homebrew", "Homebrew download cache"),
@@ -287,17 +310,29 @@ fn cache_roots(home: &Path) -> Vec<(PathBuf, String)> {
         ("pip", "Python package cache"),
         ("uv", "uv package cache"),
         ("playwright", "Playwright browser download cache"),
+        ("ms-playwright", "Playwright browser download cache"),
         ("Cypress", "Cypress binary cache"),
+        ("CocoaPods", "CocoaPods package cache"),
+        ("com.spotify.client", "Spotify app cache"),
+        ("com.microsoft.VSCode.ShipIt", "VS Code update cache"),
     ];
-    let mut roots: Vec<_> = recognized
-        .into_iter()
-        .map(|(name, desc)| (caches.join(name), desc.to_string()))
-        .collect();
+    roots.extend(
+        recognized
+            .into_iter()
+            .map(|(name, desc)| (caches.join(name), desc.to_string())),
+    );
     roots.push((home.join(".npm/_cacache"), "npm package cache".into()));
     roots.push((
         home.join(".cache/Homebrew"),
         "Homebrew download cache".into(),
     ));
+    roots.extend([
+        (home.join(".cache/uv"), "uv package cache".into()),
+        (
+            home.join(".cache/pre-commit"),
+            "pre-commit hook cache".into(),
+        ),
+    ]);
     roots.push((
         home.join("Library/Logs/DiagnosticReports"),
         "Old app crash reports".into(),
@@ -500,14 +535,22 @@ fn push_candidate(
     let process_reason = active_process_reason(policy, active_agents, &description);
     let guard_hint = description.clone();
     let (cleanable, requires_ack, risk, reason) = match policy {
-        Policy::Cache if process_reason.is_none() && is_old_enough(policy, age) => {
+        Policy::Cache
+            if process_reason.is_none()
+                && is_old_enough(policy, age)
+                && !is_offline_model_cache(&description) =>
+        {
             (true, false, "safe", None)
         }
         Policy::Cache => (
             true,
             true,
             "review",
-            Some(process_reason.unwrap_or("Used within the last 7 days. Review before clearing.")),
+            Some(process_reason.unwrap_or(if is_offline_model_cache(&description) {
+                "This cache contains downloaded models. Removing them may make models unavailable offline. Review before clearing."
+            } else {
+                "Used within the last 7 days. Review before clearing."
+            })),
         ),
         Policy::Session => (
             true,
@@ -523,7 +566,9 @@ fn push_candidate(
             true,
             true,
             "review",
-            Some(process_reason.unwrap_or("Build files can belong to recent or active work. Review before clearing.")),
+            Some(process_reason.unwrap_or(
+                "Build files can belong to recent or active work. Review before clearing.",
+            )),
         ),
         Policy::ReadOnly => (
             true,
@@ -823,7 +868,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
     if active_process_reason(Policy::Session, &active_processes, "").is_some() {
         note_scan_warning(
             &mut warnings,
-            "AI coding tools are open. Session transcripts are protected until those apps are closed.",
+            "AI coding tools are open. Session history may be changing. Review files before clearing them.",
         );
     }
     let report = ScanReport {
@@ -896,7 +941,8 @@ fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
         }
         Policy::ReadOnly => {
             path.parent().is_some_and(|p| p == home.join("Downloads"))
-                && fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
+                && fs::symlink_metadata(path)
+                    .is_ok_and(|meta| meta.is_file() && !meta.file_type().is_symlink())
         }
     }
 }
@@ -914,6 +960,11 @@ fn is_old_enough(policy: Policy, age_secs: u64) -> bool {
     }
 }
 
+fn is_offline_model_cache(description: &str) -> bool {
+    let description = description.to_lowercase();
+    description.contains("hugging face") && description.contains("model cache")
+}
+
 fn active_process_reason(policy: Policy, active: &[String], hint: &str) -> Option<&'static str> {
     let has = |needles: &[&str]| {
         active
@@ -927,16 +978,18 @@ fn active_process_reason(policy: Policy, active: &[String], hint: &str) -> Optio
                 "claude", "codex", "gemini", "cursor", "windsurf", "opencode",
             ]) =>
         {
-            Some("An AI coding tool is open. Close it before clearing session history.")
+            Some(
+                "An AI coding tool is open. Session history may be changing. Review before clearing.",
+            )
         }
         Policy::Developer if has(&["xcode", "xcodebuild", "simulator"]) => {
-            Some("Xcode or Simulator is open. Close it before clearing build files.")
+            Some("Xcode or Simulator is open. Build files may be in use. Review before clearing.")
         }
         Policy::Cache if hint.contains("xcode") && has(&["xcode", "xcodebuild", "simulator"]) => {
-            Some("Xcode or Simulator is open. Close it before clearing its caches.")
+            Some("Xcode or Simulator is open. This cache may be in use. Review before clearing.")
         }
         Policy::Cache if hint.contains("homebrew") && has(&["brew", "homebrew"]) => {
-            Some("Homebrew is running. Close it before clearing its download cache.")
+            Some("Homebrew is running. This cache may be in use. Review before clearing.")
         }
         Policy::Cache
             if ["npm", "pnpm", "yarn", "playwright", "cypress"]
@@ -944,7 +997,9 @@ fn active_process_reason(policy: Policy, active: &[String], hint: &str) -> Optio
                 .any(|name| hint.contains(name))
                 && has(&["node", "npm", "pnpm", "yarn", "playwright", "cypress"]) =>
         {
-            Some("A package manager or browser build is open. Close it before clearing this cache.")
+            Some(
+                "A package manager or browser build is open. This cache may be in use. Review before clearing.",
+            )
         }
         Policy::Cache
             if ["python", "pip", "uv"]
@@ -952,7 +1007,9 @@ fn active_process_reason(policy: Policy, active: &[String], hint: &str) -> Optio
                 .any(|name| hint.contains(name))
                 && has(&["python", "pip", "uv"]) =>
         {
-            Some("A Python package process is open. Close it before clearing this cache.")
+            Some(
+                "A Python package process is open. This cache may be in use. Review before clearing.",
+            )
         }
         _ => None,
     }
@@ -1007,14 +1064,17 @@ fn cleanup_selected(
             });
             continue;
         };
-        let active_reason = active_process_reason(snapshot.policy, &active_processes, &snapshot.guard_hint);
+        let active_reason =
+            active_process_reason(snapshot.policy, &active_processes, &snapshot.guard_hint);
         let failure = if !snapshot.cleanable {
             Some(
                 "This item is protected. Only items marked as cleanable can be moved to Trash."
                     .into(),
             )
         } else if (snapshot.requires_ack || active_reason.is_some()) && !acknowledge_risk {
-            Some("Review the selected items and confirm that you want to move them to Trash.".into())
+            Some(
+                "Review the selected items and confirm that you want to move them to Trash.".into(),
+            )
         } else if !policy_allows(&snapshot.path, home, snapshot.policy) {
             Some("This location is protected and cannot be moved to Trash.".into())
         } else {
@@ -1038,11 +1098,13 @@ fn cleanup_selected(
             });
             continue;
         }
-        if !acknowledge_risk && let Some(reason) = active_process_reason(
-            snapshot.policy,
-            &running_agent_names(),
-            &snapshot.guard_hint,
-        ) {
+        if !acknowledge_risk
+            && let Some(reason) = active_process_reason(
+                snapshot.policy,
+                &running_agent_names(),
+                &snapshot.guard_hint,
+            )
+        {
             result.failures.push(CleanupFailure {
                 id,
                 message: reason.into(),
@@ -1112,8 +1174,8 @@ async fn trash_items(
     let result = tauri::async_runtime::spawn_blocking(move || {
         cleanup_selected(&home, item_ids, selected, acknowledge_risk)
     })
-            .await
-            .map_err(|_| "The cleanup could not finish.".to_string())?;
+    .await
+    .map_err(|_| "The cleanup could not finish.".to_string())?;
     Ok(result)
 }
 
@@ -1194,33 +1256,51 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_policy_is_allowlisted_and_downloads_are_never_removable() {
-        let home = Path::new("/Users/tester");
-        assert!(!policy_allows(
-            &home.join("Downloads/movie.mov"),
-            home,
+    fn cleanup_policy_is_allowlisted_and_downloads_are_direct_files_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = tmp.path().join("home");
+        let download = home.join("Downloads/movie.mov");
+        fs::create_dir_all(download.parent().ok_or("missing Downloads")?)?;
+        fs::write(&download, "movie")?;
+        assert!(policy_allows(&download, &home, Policy::ReadOnly));
+        assert!(!policy_root_allows(
+            &home.join("Downloads/folder/movie.mov"),
+            &home,
             Policy::ReadOnly
         ));
+        #[cfg(unix)]
+        {
+            let external = tmp.path().join("external.mov");
+            fs::write(&external, "outside")?;
+            std::os::unix::fs::symlink(&external, home.join("Downloads/link.mov"))?;
+            assert!(!policy_allows(
+                &home.join("Downloads/link.mov"),
+                &home,
+                Policy::ReadOnly
+            ));
+        }
         assert!(!policy_allows(
             &home.join(".claude/settings.json"),
-            home,
+            &home,
             Policy::Session
         ));
         assert!(policy_root_allows(
             &home.join(".claude/projects/project/session.jsonl"),
-            home,
+            &home,
             Policy::Session
         ));
         assert!(!policy_root_allows(
             &home.join(".claude/projects/project/settings.json"),
-            home,
+            &home,
             Policy::Session
         ));
         assert!(policy_root_allows(
             &home.join("Library/Developer/Xcode/DerivedData/project"),
-            home,
+            &home,
             Policy::Developer
         ));
+        Ok(())
     }
 
     #[test]
@@ -1248,32 +1328,154 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_rejects_unknown_and_read_only_items_without_moving_files()
+    fn additional_cache_roots_are_specific_and_model_cache_requires_review() {
+        let home = Path::new("/Users/tester");
+        let roots = cache_roots(home);
+        for (relative, description) in [
+            (".cache/uv", "uv package cache"),
+            (".cache/puppeteer", "Puppeteer browser download cache"),
+            (".cache/pre-commit", "pre-commit hook cache"),
+            (
+                ".cache/huggingface/hub",
+                "Hugging Face downloaded model cache. Removing it may make models unavailable offline.",
+            ),
+            (
+                "Library/Application Support/Spotify/PersistentCache",
+                "Spotify persistent cache",
+            ),
+            (
+                "Library/Application Support/stremio-server/stremio-cache",
+                "Stremio server cache",
+            ),
+            (
+                "Library/iTunes/iPhone Software Updates",
+                "iPhone software update files",
+            ),
+            (
+                "Library/Caches/ms-playwright",
+                "Playwright browser download cache",
+            ),
+            ("Library/Caches/CocoaPods", "CocoaPods package cache"),
+            ("Library/Caches/com.spotify.client", "Spotify app cache"),
+            (
+                "Library/Caches/com.microsoft.VSCode.ShipIt",
+                "VS Code update cache",
+            ),
+        ] {
+            assert!(roots.contains(&(home.join(relative), description.into())));
+        }
+        assert!(
+            !roots
+                .iter()
+                .any(|(path, _)| { path == &home.join(".cache/huggingface/lerobot") })
+        );
+        let model_hub = home.join(".cache/huggingface/hub");
+        assert!(policy_root_allows(
+            &model_hub.join("models--example"),
+            home,
+            Policy::Cache
+        ));
+        assert!(is_offline_model_cache(
+            "Hugging Face downloaded model cache. Removing it may make models unavailable offline."
+        ));
+    }
+
+    #[test]
+    fn cleanup_requires_acknowledgement_and_preserves_changed_file()
     -> Result<(), Box<dyn std::error::Error>> {
         let tmp = TempDir::new()?;
         let home = tmp.path().join("home");
         let downloads = home.join("Downloads/large.mov");
         fs::create_dir_all(downloads.parent().ok_or("missing parent")?)?;
         fs::write(&downloads, "keep")?;
+        let scanned_fingerprint = fingerprint(&downloads).map_err(std::io::Error::other)?;
         let snapshot = Snapshot {
             path: downloads.clone(),
             policy: Policy::ReadOnly,
-            cleanable: false,
+            cleanable: true,
+            requires_ack: true,
             guard_hint: "Large download taking up space".into(),
-            fingerprint: fingerprint(&downloads).map_err(std::io::Error::other)?,
+            fingerprint: scanned_fingerprint,
         };
-        let protected = cleanup_selected(
+        let unacknowledged = cleanup_selected(
             &home,
             vec!["read-only".into()],
             vec![("read-only".into(), snapshot)],
+            false,
         );
-        assert_eq!(protected.trashed_ids.len(), 0);
-        assert_eq!(protected.failures.len(), 1);
+        assert_eq!(unacknowledged.trashed_ids.len(), 0);
+        assert_eq!(unacknowledged.failures.len(), 1);
+        assert!(unacknowledged.failures[0].message.contains("Review"));
         assert!(downloads.exists());
-        let unknown = cleanup_selected(&home, vec!["unknown".into()], Vec::new());
+        fs::write(&downloads, "changed since scan")?;
+        let acknowledged = cleanup_selected(
+            &home,
+            vec!["read-only".into()],
+            vec![(
+                "read-only".into(),
+                Snapshot {
+                    path: downloads.clone(),
+                    policy: Policy::ReadOnly,
+                    cleanable: true,
+                    requires_ack: true,
+                    guard_hint: "Large download taking up space".into(),
+                    fingerprint: scanned_fingerprint,
+                },
+            )],
+            true,
+        );
+        assert_eq!(acknowledged.trashed_ids.len(), 0);
+        assert_eq!(acknowledged.failures.len(), 1);
+        assert!(
+            acknowledged.failures[0]
+                .message
+                .contains("changed since the scan")
+        );
+        assert!(downloads.exists());
+        let unknown = cleanup_selected(&home, vec!["unknown".into()], Vec::new(), false);
         assert_eq!(unknown.trashed_ids.len(), 0);
         assert_eq!(unknown.failures.len(), 1);
         assert!(downloads.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn recent_sessions_remain_selectable_but_require_review()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let home = tmp.path().join("home");
+        let session = home.join(".codex/sessions/recent.jsonl");
+        fs::create_dir_all(session.parent().ok_or("missing session parent")?)?;
+        fs::write(&session, "session data")?;
+        let mut budget = 0;
+        let mut items = Vec::new();
+        let mut snapshots = HashMap::new();
+        let mut warnings = Vec::new();
+        push_candidate(
+            "agents",
+            Policy::Session,
+            session,
+            "Conversation transcript. It may contain prompts and paths.".into(),
+            "Codex transcript".into(),
+            &["claude".into()],
+            Instant::now(),
+            &mut budget,
+            &mut items,
+            &mut snapshots,
+            &mut warnings,
+        );
+        assert_eq!(items.len(), 1);
+        assert!(items[0].cleanable);
+        assert!(items[0].requires_ack);
+        assert_eq!(items[0].risk, "review");
+        assert!(
+            items[0]
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("open"))
+        );
+        assert!(snapshots[&items[0].id].cleanable);
+        assert!(snapshots[&items[0].id].requires_ack);
         Ok(())
     }
 
