@@ -24,7 +24,7 @@ const MAX_SCAN_SECONDS: u64 = 30;
 const MAX_VISITED: usize = 500_000;
 const MAX_TEMP_SCAN_SECONDS: u64 = 10;
 const MAX_TEMP_VISITED: usize = 200_000;
-const DEEP_SCAN_SECONDS: u64 = 60;
+const DEEP_SCAN_SECONDS: u64 = 120;
 const DEEP_SCAN_VISITED: usize = 3_000_000;
 const MAX_SCAN_ITEMS: usize = 5_000;
 const MAX_AGENT_ITEMS: usize = 1_500;
@@ -91,6 +91,7 @@ struct CleanupReport {
     moved_bytes: u64,
     free_bytes_before: Option<u64>,
     free_bytes_after: Option<u64>,
+    volume_after: Option<Volume>,
 }
 
 #[derive(Serialize)]
@@ -1821,7 +1822,8 @@ async fn trash_items(
         .await
         .map_err(|error| format!("The cleanup could not finish: {error}"))?
     };
-    let after = volume_info(&home).ok().map(|volume| volume.free_bytes);
+    let volume_after = volume_info(&home).ok();
+    let after = volume_after.as_ref().map(|volume| volume.free_bytes);
     let mut registry = lock_registry(&state);
     let moved_bytes = result.trashed_ids.iter().fold(0_u64, |total, id| {
         total.saturating_add(
@@ -1843,6 +1845,7 @@ async fn trash_items(
         result,
         free_bytes_before: before,
         free_bytes_after: after,
+        volume_after,
     })
 }
 

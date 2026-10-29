@@ -200,6 +200,34 @@ fn named_roots(home: &Path) -> Vec<(PathBuf, &'static str, &'static str, &'stati
     let mut add = |path: PathBuf, category, source, desc, handling| {
         roots.push((path, category, source, desc, handling))
     };
+    for path in [
+        ".claude/debug",
+        ".claude/cache",
+        ".codex/log",
+        ".codex/tmp",
+        ".codex/shell_snapshots",
+    ] {
+        add(
+            home.join(path),
+            "agents",
+            "Agent cache and debug output",
+            "Agent diagnostics or generated shell state. Close the related tool and review before clearing",
+            Handling::Cache,
+        );
+    }
+    for path in [
+        ".claude/file-history",
+        ".claude/paste-cache",
+        ".codex/state_5.sqlite",
+    ] {
+        add(
+            home.join(path),
+            "agents",
+            "Agent history and backups",
+            "Agent state or backups that may contain work you want to preserve. Inspect before removing",
+            Handling::Sensitive,
+        );
+    }
     let caches = home.join("Library/Caches");
     for (name, label) in [
         ("pip", "pip wheel cache"),
@@ -1015,6 +1043,7 @@ mod tests {
             .join("Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw");
         fs::create_dir_all(docker_disk.parent().unwrap()).unwrap();
         fs::write(&docker_disk, b"vm disk fixture").unwrap();
+        let docker_disk = fs::canonicalize(docker_disk).unwrap();
         let result = discover(home.path(), false);
         assert!(
             result

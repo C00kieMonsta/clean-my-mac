@@ -50,6 +50,7 @@ export interface ScanReport {
 }
 
 export interface CleanupResult {
+  volumeAfter?: ScanReport["volume"] | null;
   trashedIds: string[];
   reclaimedBytes: number;
   movedBytes?: number;

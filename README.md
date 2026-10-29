@@ -8,7 +8,7 @@ Scans run locally. The app does not upload file names, paths, or contents, and i
 
 Quick scan checks known coding-agent transcripts, named application and developer caches, selected temporary build output, Xcode DerivedData, and large files directly in Downloads. It also reports selected model and app data as read-only findings. Deep scan adds bounded discovery under common project folders such as `Developer`, `Projects`, `Code`, and `src`. It looks for known build artifacts, dependency folders, and Git-linked worktrees. It can find more locations, but it does not search every disk path.
 
-The scan has independent safety limits. Agent history is limited to 5 seconds, 30,000 visited entries, and 1,500 findings. Quick scans limit temporary output to 10 seconds and 200,000 entries. Deep scans allow 60 seconds and 3,000,000 entries for this stage. Other scan stages use 30-second and 500,000-entry limits, with up to 5,000 findings. Deep discovery has its own 20-second, 50,000-entry, depth-7, and 2,500-candidate limits. Additional measurement allows 30 seconds and 500,000 entries in quick scans, or 60 seconds and 3,000,000 entries in deep scans. The app reports when a scan reaches a limit, so results may be partial.
+The scan has independent safety limits. Agent history is limited to 5 seconds, 30,000 visited entries, and 1,500 findings. Quick scans limit temporary output to 10 seconds and 200,000 entries. Deep scans allow 120 seconds and 3,000,000 entries for this stage. Other scan stages use 30-second and 500,000-entry limits, with up to 5,000 findings. Deep discovery has its own 20-second, 50,000-entry, depth-7, and 2,500-candidate limits. Additional measurement allows 30 seconds and 500,000 entries in quick scans, or 120 seconds and 3,000,000 entries in deep scans. The app reports when a scan reaches a limit, so results may be partial.
 
 Some findings are intentionally read-only because they may contain valuable or required data. Examples include local model downloads, Android SDKs and virtual devices, iPhone backups, Xcode archives and device logs, Cursor application databases, Docker's virtual machine disk, and some project build output. These findings help explain disk use. They cannot be selected for deletion by Clean My Mac.
 
@@ -16,7 +16,7 @@ The System insights view separately reports local snapshots, top memory-using pr
 
 ## Reviewing and cleaning
 
-Each finding shows its path, size, age or reason where available, and cleanup risk. You can select individual findings. Recent or active histories and caches, model caches, personal Downloads files, and manually selected folders require a risk acknowledgement. Sensitive app data and protected worktrees remain read-only.
+Each finding shows its path, size, age or reason where available, and cleanup risk. You can select individual findings. Click Potential cleanup to show only eligible findings, then use Select all eligible or choose individual checkboxes. Cleanup updates disk capacity and removes completed entries without forcing another deep scan. Use Scan again when you want a fresh scan. Recent or active histories and caches, model caches, personal Downloads files, and manually selected folders require a risk acknowledgement. Sensitive app data and protected worktrees remain read-only.
 
 Ordinary files are moved to the macOS Trash after you review and confirm. They continue to use disk space until the Trash is emptied. A changed path, unsafe link, path outside the cleanup allowlist, or item that cannot safely be moved is rejected.
 

@@ -472,6 +472,19 @@ h1 {
   position: relative;
   overflow: hidden;
 }
+.stat-action {
+  width: 100%;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+}
+.stat-action:hover:not(:disabled) {
+  border-color: #79648e;
+  box-shadow: 0 0 0 1px #79648e44;
+}
+.stat-action:disabled {
+  cursor: default;
+}
 .stat-card.highlight {
   background: linear-gradient(120deg, #35303f, #302d39);
   border-color: #51465f;
@@ -877,6 +890,16 @@ h1 {
 .scan-footnote svg {
   color: #9e9aab;
 }
+.scan-active-note {
+  margin: 12px 0;
+  padding: 10px 12px;
+  border: 1px solid #51465f;
+  border-radius: 7px;
+  background: #302d39;
+  color: #d5c4ec;
+  font-size: 10px;
+  line-height: 1.5;
+}
 .scope-note {
   margin-left: auto;
   color: #62646f;
@@ -931,7 +954,9 @@ h1 {
 .action-buttons {
   display: flex;
   align-items: center;
-  gap: 20px;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 10px 16px;
 }
 .text-button {
   display: flex;

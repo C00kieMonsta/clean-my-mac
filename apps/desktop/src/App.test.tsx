@@ -419,6 +419,72 @@ describe("Clean My Mac cleanup review", () => {
     ).not.toBeChecked();
   });
 
+  it("shows eligible findings from the potential card and selects review-only items safely", async () => {
+    const reviewOnlyReport: ScanReport = {
+      ...report,
+      items: report.items.map((item) =>
+        item.risk === "protected" ? item : { ...item, risk: "review" },
+      ),
+    };
+    bridge.scanSystem.mockResolvedValue(reviewOnlyReport);
+    bridge.trashItems.mockResolvedValue({
+      trashedIds: ["session-old", "session-recent", "cache-old", "download-large"],
+      reclaimedBytes: 18_000_000,
+      failures: [],
+    } satisfies CleanupResult);
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /Potential cleanup.*Show eligible findings/ }),
+    );
+    expect(screen.getByRole("button", { name: "Can clean" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    expect(screen.queryByRole("checkbox", { name: "Select Developer files" }))
+      .not.toBeInTheDocument();
+    expect(
+      await screen.findByRole("checkbox", { name: "Select Old agent conversation" }),
+    ).toBeInTheDocument();
+    expect(
+      screen.queryByRole("checkbox", { name: "Select Protected configuration" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Select recommended" }),
+    ).not.toBeInTheDocument();
+    const selectAll = screen.getByRole("button", { name: "Select all eligible" });
+    expect(selectAll).toBeEnabled();
+    fireEvent.click(selectAll);
+    expect(screen.getByText("4 items ready for your review")).toBeInTheDocument();
+    navigateTo("Developer files");
+    expect(
+      await screen.findByRole("checkbox", { name: "Select Protected configuration" }),
+    ).toBeDisabled();
+    fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
+
+    const dialog = await screen.findByRole("dialog", { name: "Review your cleanup" });
+    const moveButton = within(dialog).getByRole("button", { name: "Move to Trash" });
+    expect(moveButton).toBeDisabled();
+    fireEvent.click(moveButton);
+    expect(bridge.trashItems).not.toHaveBeenCalled();
+
+    fireEvent.click(
+      within(dialog).getByRole("checkbox", {
+        name: "I understand these files may be in use, contain history I need, or include personal data.",
+      }),
+    );
+    expect(moveButton).toBeEnabled();
+    fireEvent.click(moveButton);
+    await waitFor(() =>
+      expect(bridge.trashItems).toHaveBeenCalledWith(
+        "scan-123",
+        ["session-old", "session-recent", "cache-old", "download-large"],
+        true,
+      ),
+    );
+  });
+
   it("waits for confirmation and sends the scan token with only the chosen item ids", async () => {
     render(<App />);
     await screen.findByText("Macintosh HD");
@@ -448,6 +514,13 @@ describe("Clean My Mac cleanup review", () => {
     bridge.trashItems.mockResolvedValue({
       trashedIds: ["cache-old"],
       reclaimedBytes: 5_000_000,
+      freeBytesBefore: 250_000_000_000,
+      freeBytesAfter: 270_000_000_000,
+      volumeAfter: {
+        ...report.volume,
+        availableBytes: 270_000_000_000,
+        freeBytes: 270_000_000_000,
+      },
       failures: [
         {
           id: "session-old",
@@ -484,7 +557,7 @@ describe("Clean My Mac cleanup review", () => {
         "cache-old",
       ], true),
     );
-    expect(await screen.findByText(/Last cleanup: 1 item moved to Trash/)).toBeInTheDocument();
+    expect(await screen.findByRole("alert")).toHaveTextContent(/1 item moved to Trash/);
     expect(screen.getByRole("alert")).toHaveTextContent("Trash items still occupy disk space until Trash is emptied");
     expect(screen.getByRole("alert")).toHaveTextContent("This conversation changed during the scan.");
     expect(
@@ -493,6 +566,12 @@ describe("Clean My Mac cleanup review", () => {
     expect(
       screen.getByRole("checkbox", { name: "Select Old agent conversation" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("checkbox", { name: "Select Old agent conversation" }),
+    ).toBeEnabled();
+    navigateTo("Overview");
+    expect(screen.getByText("270 GB free")).toBeInTheDocument();
+    expect(bridge.scanSystem).toHaveBeenCalledTimes(1);
     fireEvent.click(
       screen.getByRole("button", {
         name: "View moved files and original locations",

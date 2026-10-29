@@ -49,7 +49,7 @@ import {
 import { Modal } from "./components/Modal";
 
 type View = "overview" | "system" | Category;
-type Filter = "all" | "recommended" | "review";
+type Filter = "all" | "eligible" | "recommended" | "review";
 const MAX_SELECTION = 5_000;
 const icons = {
   agents: Bot,
@@ -139,6 +139,7 @@ export default function App() {
     null,
   );
   const scanRunning = useRef(false);
+  const findingsRef = useRef<HTMLElement>(null);
   const items = report?.items ?? [];
   const eligible = eligibleItems(items);
   const chosen = selectedItems(items, selected);
@@ -319,6 +320,32 @@ export default function App() {
       });
     }
   }
+  function showEligibleFindings() {
+    setView("overview");
+    setFilter("eligible");
+    setSource("all");
+    setQuery("");
+    setExpanded(
+      new Set(
+        categories
+          .filter((category) => eligible.some((item) => item.category === category.id))
+          .map((category) => category.id),
+      ),
+    );
+    requestAnimationFrame(() =>
+      findingsRef.current?.scrollIntoView?.({ behavior: "smooth", block: "start" }),
+    );
+  }
+  function selectAllEligible() {
+    setSelected(new Set(eligible.slice(0, MAX_SELECTION).map((item) => item.id)));
+    setRiskAcknowledged(false);
+    if (eligible.length > MAX_SELECTION) {
+      setNotice({
+        text: `Selected the first ${MAX_SELECTION.toLocaleString()} eligible items. Clear this batch before selecting the rest.`,
+        error: false,
+      });
+    }
+  }
   function toggleExpanded(category: Category) {
     setExpanded((previous) => {
       const next = new Set(previous);
@@ -356,11 +383,11 @@ export default function App() {
           ? {
               ...previous,
               items: previous.items.filter((item) => !removed.has(item.id)),
-              volume: result.freeBytesAfter == null ? previous.volume : {
+              volume: result.volumeAfter ?? (result.freeBytesAfter == null ? previous.volume : {
                 ...previous.volume,
                 freeBytes: result.freeBytesAfter,
                 availableBytes: result.freeBytesAfter,
-              },
+              }),
             }
           : previous,
       );
@@ -383,7 +410,6 @@ export default function App() {
         text: summary,
         error: result.failures.length > 0,
       });
-      if (completedItems.length > 0) void scan();
     } catch (error) {
       setNotice({ text: errorMessage(error), error: true });
       setModal(null);
@@ -396,7 +422,9 @@ export default function App() {
       items.filter((item) => {
         const matchesFilter =
           filter === "all" ||
-          (filter === "recommended"
+          (filter === "eligible"
+            ? item.cleanable && item.risk !== "protected"
+            : filter === "recommended"
             ? item.risk === "safe" && item.cleanable
             : item.risk !== "safe" || !item.cleanable);
         return (
@@ -473,7 +501,7 @@ export default function App() {
             <ChevronRight size={14} />
           </button>
           <div className="version">
-            Clean My Mac <span>v0.2.0</span>
+            Clean My Mac <span>v0.2.1</span>
           </div>
         </div>
       </aside>
@@ -629,7 +657,12 @@ export default function App() {
                 {report?.volume.availableForImportantUsageBytes != null && <p className="storage-context">macOS reports {formatBytes(report.volume.availableForImportantUsageBytes)} available for important use. This includes reclaimable space and differs from free space.</p>}
               </section>
               <section className="stats-grid" aria-label="Scan summary">
-                <div className="stat-card highlight">
+                <button
+                  className="stat-card highlight stat-action"
+                  onClick={showEligibleFindings}
+                  disabled={!eligible.length}
+                  aria-label={`Potential cleanup, ${formatBytes(reclaimable)} across ${eligible.length.toLocaleString()} eligible items. Show eligible findings`}
+                >
                   <div className="stat-label">
                     <Sparkles size={16} />
                     Potential cleanup
@@ -643,7 +676,7 @@ export default function App() {
                   <p>
                     Across {eligible.length.toLocaleString()} eligible items
                   </p>
-                </div>
+                </button>
                 <button
                   className="stat-card stat-link"
                   onClick={() => navigate("agents")}
@@ -679,7 +712,7 @@ export default function App() {
           )}
 
           {view === "system" && <SystemInsightsPanel insights={insights} busy={insightsBusy} error={insightsError} retry={() => void loadInsights()} openSettings={(section) => void settings(section)} />}
-          <section className={`findings ${view === "system" ? "system-hidden" : ""}`} aria-labelledby="findings-title">
+          <section ref={findingsRef} className={`findings ${view === "system" ? "system-hidden" : ""}`} aria-labelledby="findings-title">
             <div className="section-heading">
               <div>
                 <h2 id="findings-title">
@@ -696,12 +729,14 @@ export default function App() {
                 </p>
               </div>
             </div>
+            {scanning && <div className="scan-active-note" role="status">Selection is paused while the scan refreshes these findings. Your current selection will be cleared when it finishes.</div>}
             {report?.coverage && <div className="coverage-note" role="status">{report.coverage.mode === "deep" ? "Deep scan" : "Quick scan"} · {report.coverage.detectors} detectors · {report.coverage.visitedEntries.toLocaleString()} entries checked · {(report.coverage.elapsedMs / 1000).toFixed(1)}s{report.warnings.length ? ` · Partial scan: ${report.warnings.length} notes` : " · Scan complete"}</div>}
             <div className="findings-toolbar">
               <div className="filters" aria-label="Filter results">
                 {(
                   [
                     ["all", "All files"],
+                    ["eligible", "Can clean"],
                     ["recommended", "Recommended"],
                     ["review", "Needs a look"],
                   ] as const
@@ -970,7 +1005,7 @@ export default function App() {
             </div>
           </div>
           <div className="action-buttons">
-            {selected.size > 0 ? (
+            {selected.size > 0 && (
               <button
                 className="text-button"
                 onClick={() => {
@@ -981,10 +1016,19 @@ export default function App() {
               >
                 Deselect all
               </button>
-            ) : (
+            )}
+            <button
+              className="text-button"
+              disabled={scanning || cleaning || !eligible.length}
+              onClick={selectAllEligible}
+            >
+              <CheckCheck size={14} />
+              Select all eligible
+            </button>
+            {recommended.length > 0 && (
               <button
                 className="text-button"
-                disabled={scanning || cleaning || !recommended.length}
+                disabled={scanning || cleaning}
                 onClick={selectRecommended}
               >
                 <Check size={14} />
