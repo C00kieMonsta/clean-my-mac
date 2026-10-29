@@ -23,6 +23,8 @@ const bridge = vi.hoisted(() => ({
   pickCleanupFolder: vi.fn(),
   trashItems: vi.fn(),
   revealItem: vi.fn(),
+  systemInsights: vi.fn(),
+  openSystemSettings: vi.fn(),
 }));
 
 vi.mock("./lib/bridge", () => ({
@@ -31,6 +33,8 @@ vi.mock("./lib/bridge", () => ({
   pickCleanupFolder: bridge.pickCleanupFolder,
   trashItems: bridge.trashItems,
   revealItem: bridge.revealItem,
+  systemInsights: bridge.systemInsights,
+  openSystemSettings: bridge.openSystemSettings,
 }));
 
 import App from "./App";
@@ -162,11 +166,57 @@ beforeEach(() => {
     failures: [],
   } satisfies CleanupResult);
   bridge.revealItem.mockResolvedValue(undefined);
+  bridge.systemInsights.mockResolvedValue({ snapshots: [], processes: [], launchAgents: [], deletedOpenFiles: [], warnings: [] });
+  bridge.openSystemSettings.mockResolvedValue(undefined);
 });
 
 afterEach(cleanup);
 
 describe("Clean My Mac cleanup review", () => {
+  it("requests a deep scan and shows its coverage", async () => {
+    bridge.scanSystem.mockResolvedValue({ ...report, coverage: { mode: "deep", detectors: 44, visitedEntries: 1200, elapsedMs: 3400 } });
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+    expect(screen.getByLabelText("Deep scan")).toBeChecked();
+    fireEvent.click(screen.getByRole("button", { name: "Scan again" }));
+    await waitFor(() => expect(bridge.scanSystem).toHaveBeenLastCalledWith(true));
+    expect(await screen.findByRole("status")).toHaveTextContent("Deep scan · 44 detectors · 1,200 entries checked · 3.4s");
+  });
+
+  it("loads system insights and supports retry after an error", async () => {
+    bridge.systemInsights.mockRejectedValueOnce(new Error("Permission denied")).mockResolvedValueOnce({
+      snapshots: [{ name: "snapshot-1", volume: "Macintosh HD", purgeable: true }],
+      processes: [{ pid: 44, name: "Example", memoryBytes: 1_000_000, cpuPercent: 2 }],
+      launchAgents: [{ path: "~/Library/LaunchAgents/helper.plist", label: "helper", program: null, programExists: false, system: false }],
+      docker: { available: true, rows: [{ kind: "Local Volumes", total: 6, active: 4, size: "14.8 GB", reclaimable: "2 GB" }] },
+      deletedOpenFiles: [], warnings: [],
+    });
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+    navigateTo("System insights");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Permission denied");
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(await screen.findByText("snapshot-1")).toBeInTheDocument();
+    expect(screen.getByText(/1 orphan candidates/)).toBeInTheDocument();
+    expect(screen.getByText("Local Volumes")).toBeInTheDocument();
+    expect(screen.getByText("14.8 GB")).toBeInTheDocument();
+    expect(screen.getByText(/Volumes can contain valuable databases and project data/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Open Docker Desktop" }));
+    expect(bridge.openSystemSettings).toHaveBeenCalledWith("docker");
+  });
+
+  it("filters results by source and sorts largest first", async () => {
+    render(<App />);
+    await screen.findByText("Macintosh HD");
+    navigateTo("Caches & logs");
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by source" }), { target: { value: "Browser" } });
+    expect(await screen.findByText("Browser cache")).toBeInTheDocument();
+    expect(screen.queryByText("Personal installer.dmg")).not.toBeInTheDocument();
+    fireEvent.change(screen.getByRole("combobox", { name: "Filter by source" }), { target: { value: "all" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Sort results" }), { target: { value: "oldest" } });
+    expect(screen.getByText("Browser cache")).toBeInTheDocument();
+  });
+
   it("adds and selects a manually chosen folder and requires risk acknowledgement", async () => {
     bridge.pickCleanupFolder.mockResolvedValue(addedFolder());
     render(<App />);
@@ -177,7 +227,7 @@ describe("Clean My Mac cleanup review", () => {
       name: "Select Talos build output",
     });
     expect(folder).toBeChecked();
-    expect(screen.getByText("Added by you")).toBeInTheDocument();
+    expect(screen.getAllByText("Added by you").length).toBeGreaterThan(0);
     expect(bridge.pickCleanupFolder).toHaveBeenCalledWith("scan-123");
 
     fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
@@ -239,7 +289,7 @@ describe("Clean My Mac cleanup review", () => {
       name: "Select Browser cache folder",
     });
     expect(added).toBeChecked();
-    expect(screen.getByText("Added by you")).toBeInTheDocument();
+    expect(screen.getAllByText("Added by you").length).toBeGreaterThan(0);
     expect(screen.getAllByRole("checkbox", { name: "Select Browser cache folder" })).toHaveLength(1);
     fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
     const dialog = await screen.findByRole("dialog", {
@@ -434,15 +484,9 @@ describe("Clean My Mac cleanup review", () => {
         "cache-old",
       ], true),
     );
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "1 item moved to Trash",
-    );
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "Empty Trash in Finder to free disk space.",
-    );
-    expect(screen.getByRole("alert")).toHaveTextContent(
-      "This conversation changed during the scan.",
-    );
+    expect(await screen.findByText(/Last cleanup: 1 item moved to Trash/)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("Trash items still occupy disk space until Trash is emptied");
+    expect(screen.getByRole("alert")).toHaveTextContent("This conversation changed during the scan.");
     expect(
       screen.queryByRole("checkbox", { name: "Select Browser cache" }),
     ).not.toBeInTheDocument();
@@ -480,7 +524,7 @@ describe("Clean My Mac cleanup review", () => {
     expect(screen.queryByText("Browser cache")).not.toBeInTheDocument();
   });
 
-  it("limits the selection to 200 items when a scan finds more recommendations", async () => {
+  it("selects all recommendations across a batch larger than 200 items", async () => {
     const template = report.items.find((item) => item.id === "cache-old");
     if (!template) throw new Error("Cache fixture is missing");
     const manyItems: ScanReport = {
@@ -497,11 +541,8 @@ describe("Clean My Mac cleanup review", () => {
     await screen.findByText("Macintosh HD");
 
     fireEvent.click(screen.getByRole("button", { name: "Select recommended" }));
-    expect(await screen.findByRole("status")).toHaveTextContent(
-      "Selected the first 200 recommended items.",
-    );
     expect(
-      screen.getByText("200 items ready for your review"),
+      screen.getByText("205 items ready for your review"),
     ).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Review cleanup" }));
     fireEvent.click(
@@ -512,9 +553,9 @@ describe("Clean My Mac cleanup review", () => {
     const ids = bridge.trashItems.mock.calls[0]?.[1] as string[];
     expect(bridge.trashItems.mock.calls[0]?.[0]).toBe("scan-123");
     expect(bridge.trashItems.mock.calls[0]?.[2]).toBe(false);
-    expect(ids).toHaveLength(200);
+    expect(ids).toHaveLength(205);
     expect(ids).toEqual(
-      Array.from({ length: 200 }, (_, index) => `cache-${index}`),
+      Array.from({ length: 205 }, (_, index) => `cache-${index}`),
     );
   });
 });

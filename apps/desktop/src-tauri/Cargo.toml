@@ -1,6 +1,6 @@
 [package]
 name = "clean-my-mac"
-version = "0.1.0"
+version = "0.2.0"
 description = "A careful storage cleaner for macOS"
 authors = ["Clean My Mac"]
 edition = "2024"
@@ -26,11 +26,16 @@ sysinfo = "0.37"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 libc = "0.2"
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSDictionary", "NSNumber"] }
+objc2-foundation = { version = "0.3", features = ["NSString", "NSURL", "NSDictionary", "NSValue", "NSArray", "NSError"] }
 thiserror = "2"
 
 [dev-dependencies]
 tempfile = "3"
+
+# Directory hashing is CPU intensive on large Cargo and package-cache trees.
+# Keep local app builds responsive without optimizing all dependencies.
+[profile.dev.package.clean-my-mac]
+opt-level = 2
 
 [profile.release]
 codegen-units = 1

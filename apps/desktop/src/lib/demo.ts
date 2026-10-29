@@ -157,5 +157,11 @@ export const demoInsights: SystemInsights = {
   processes: [{ pid: 482, name: "Docker Desktop", memoryBytes: 2.4 * GB, cpuPercent: 4.2 }, { pid: 831, name: "Code Helper", memoryBytes: 1.1 * GB, cpuPercent: 1.8 }],
   launchAgents: [{ path: "~/Library/LaunchAgents/com.example.helper.plist", label: "com.example.helper", program: "/Applications/Example.app/Contents/MacOS/helper", programExists: false, system: false }],
   deletedOpenFiles: [{ pid: 482, process: "Docker Desktop", path: "~/Library/Containers/com.docker.docker/Data/vms/0/data/Docker.raw (deleted)", bytes: 1.7 * GB }],
+  docker: { available: true, rows: [
+    { kind: "Images", total: 12, active: 4, size: "18.4 GB", reclaimable: "6.2 GB" },
+    { kind: "Containers", total: 8, active: 3, size: "2.1 GB", reclaimable: "1.4 GB" },
+    { kind: "Local Volumes", total: 6, active: 4, size: "14.8 GB", reclaimable: "2.0 GB" },
+    { kind: "Build Cache", total: 21, active: 0, size: "0.8 GB", reclaimable: "0.8 GB" },
+  ] },
   warnings: [],
 };

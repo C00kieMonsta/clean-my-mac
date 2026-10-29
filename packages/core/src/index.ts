@@ -7,6 +7,7 @@ export interface ScanItem {
   name: string;
   path: string;
   bytes: number;
+  allocatedBytes?: number;
   fileCount: number;
   modifiedAt: number;
   description: string;
@@ -31,6 +32,11 @@ export interface SystemInsights {
   processes: { pid: number; name: string; memoryBytes: number; cpuPercent: number }[];
   launchAgents: { path: string; label: string; program: string | null; programExists: boolean | null; system: boolean }[];
   deletedOpenFiles: { pid: number; process: string; path: string; bytes: number }[];
+  docker?: {
+    available: boolean;
+    error?: string;
+    rows: { kind: string; total: number; active: number; size: string; reclaimable: string }[];
+  };
   warnings: string[];
 }
 
@@ -46,6 +52,9 @@ export interface ScanReport {
 export interface CleanupResult {
   trashedIds: string[];
   reclaimedBytes: number;
+  movedBytes?: number;
+  freeBytesBefore?: number;
+  freeBytesAfter?: number;
   failures: { id: string; message: string }[];
 }
 

@@ -1,3 +1,7 @@
+mod discovery;
+mod insights;
+mod worktrees;
+
 use chrono::Utc;
 use serde::Serialize;
 use std::{
@@ -20,11 +24,13 @@ const MAX_SCAN_SECONDS: u64 = 30;
 const MAX_VISITED: usize = 500_000;
 const MAX_TEMP_SCAN_SECONDS: u64 = 10;
 const MAX_TEMP_VISITED: usize = 200_000;
+const DEEP_SCAN_SECONDS: u64 = 60;
+const DEEP_SCAN_VISITED: usize = 3_000_000;
 const MAX_SCAN_ITEMS: usize = 5_000;
 const MAX_AGENT_ITEMS: usize = 1_500;
 const MAX_AGENT_VISITED: usize = 30_000;
 const MAX_AGENT_SCAN_SECONDS: u64 = 5;
-const MAX_TRASH_SELECTION: usize = 200;
+const MAX_TRASH_SELECTION: usize = MAX_SCAN_ITEMS;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -32,6 +38,9 @@ struct Volume {
     name: String,
     total_bytes: u64,
     available_bytes: u64,
+    free_bytes: u64,
+    purgeable_bytes: u64,
+    available_for_important_usage_bytes: u64,
 }
 
 #[derive(Clone, Serialize)]
@@ -50,6 +59,8 @@ struct Item {
     cleanable: bool,
     requires_ack: bool,
     reason: Option<String>,
+    cleanup_kind: Option<String>,
+    allocated_bytes: Option<u64>,
 }
 
 #[derive(Clone, Serialize)]
@@ -60,6 +71,26 @@ struct ScanReport {
     volume: Volume,
     items: Vec<Item>,
     warnings: Vec<String>,
+    coverage: ScanCoverage,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanCoverage {
+    mode: String,
+    detectors: usize,
+    visited_entries: usize,
+    elapsed_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CleanupReport {
+    #[serde(flatten)]
+    result: CleanupResult,
+    moved_bytes: u64,
+    free_bytes_before: Option<u64>,
+    free_bytes_after: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -85,6 +116,9 @@ enum Policy {
     Temporary,
     Manual,
     ReadOnly,
+    Discovered,
+    Sensitive,
+    Worktree,
 }
 
 #[derive(Clone)]
@@ -105,6 +139,7 @@ struct Fingerprint {
     root_dev: u64,
     root_ino: u64,
     digest: u64,
+    allocated_bytes: u64,
 }
 
 #[derive(Default)]
@@ -237,6 +272,11 @@ fn manual_path_is_allowlisted(path: &Path, home: &Path) -> bool {
     no_symlink_path(&canonical_path, boundary)
 }
 
+fn allocated_size(meta: &Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+
 fn metadata_identity(meta: &Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
@@ -266,6 +306,7 @@ fn measure_tree(
     max_seconds: u64,
     max_entries: usize,
 ) -> Result<Fingerprint, String> {
+    use std::os::unix::fs::MetadataExt;
     let root_meta =
         fs::symlink_metadata(path).map_err(|e| format!("Item is no longer available: {e}"))?;
     if root_meta.file_type().is_symlink() {
@@ -282,6 +323,7 @@ fn measure_tree(
             root_dev,
             root_ino,
             digest,
+            allocated_bytes: allocated_size(&root_meta),
         });
     }
     if !root_meta.is_dir() {
@@ -289,8 +331,10 @@ fn measure_tree(
     }
     let mut stack = vec![path.to_path_buf()];
     let mut total = 0_u64;
+    let mut allocated = 0_u64;
     let mut count = 0_u64;
     let mut newest = modified_secs(&root_meta);
+    let mut linked_files = HashSet::new();
     while let Some(dir) = stack.pop() {
         if started.elapsed() > Duration::from_secs(max_seconds) || *budget >= max_entries {
             return Err(
@@ -319,7 +363,12 @@ fn measure_tree(
             if meta.is_dir() {
                 stack.push(child_path);
             } else if meta.is_file() {
-                total = total.saturating_add(meta.len());
+                // Build tools frequently hard-link artifacts into several folders.
+                // Fingerprint every path, but count the shared inode only once.
+                if meta.nlink() <= 1 || linked_files.insert(metadata_identity(&meta)) {
+                    total = total.saturating_add(meta.len());
+                    allocated = allocated.saturating_add(allocated_size(&meta));
+                }
                 count = count.saturating_add(1);
             }
         }
@@ -331,11 +380,18 @@ fn measure_tree(
         root_dev,
         root_ino,
         digest,
+        allocated_bytes: allocated,
     })
 }
 
 fn fingerprint(path: &Path) -> Result<Fingerprint, String> {
-    measure_tree(path, Instant::now(), &mut 0, MAX_SCAN_SECONDS, MAX_VISITED)
+    measure_tree(
+        path,
+        Instant::now(),
+        &mut 0,
+        DEEP_SCAN_SECONDS,
+        DEEP_SCAN_VISITED,
+    )
 }
 
 fn inspect_tree(
@@ -569,10 +625,17 @@ fn volume_info(home: &Path) -> Result<Volume, String> {
     // SAFETY: statvfs returned success and initialized the output structure.
     let stats = unsafe { stats.assume_init() };
     let block = stats.f_frsize;
+    let free = block.saturating_mul(stats.f_bavail as u64);
+    let capacity = insights::storage_capacity(home);
     Ok(Volume {
         name: "Macintosh HD".into(),
         total_bytes: block.saturating_mul(stats.f_blocks as u64),
-        available_bytes: block.saturating_mul(stats.f_bavail as u64),
+        available_bytes: free,
+        free_bytes: free,
+        purgeable_bytes: capacity.as_ref().map_or(0, |value| value.purgeable_bytes),
+        available_for_important_usage_bytes: capacity
+            .as_ref()
+            .map_or(free, |value| value.available_for_important_usage_bytes),
     })
 }
 
@@ -598,10 +661,6 @@ fn push_candidate(
         );
         return;
     }
-    let name = path
-        .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.display().to_string());
     let Ok(meta) = fs::symlink_metadata(&path) else {
         return;
     };
@@ -615,6 +674,50 @@ fn push_candidate(
     } else {
         (MAX_SCAN_SECONDS, MAX_VISITED)
     };
+    register_candidate(
+        category,
+        policy,
+        path,
+        description,
+        source,
+        active_agents,
+        started,
+        budget,
+        items,
+        snapshots,
+        warnings,
+        max_seconds,
+        max_entries,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn register_candidate(
+    category: &str,
+    policy: Policy,
+    path: PathBuf,
+    description: String,
+    source: String,
+    active_agents: &[String],
+    started: Instant,
+    budget: &mut usize,
+    items: &mut Vec<Item>,
+    snapshots: &mut HashMap<String, Snapshot>,
+    warnings: &mut Vec<String>,
+    max_seconds: u64,
+    max_entries: usize,
+) {
+    if items.len() >= MAX_SCAN_ITEMS {
+        note_scan_warning(
+            warnings,
+            "The scan reached its item limit. Some items may be missing.",
+        );
+        return;
+    }
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
     let fp = match inspect_tree(&path, started, budget, max_seconds, max_entries) {
         Ok(fp) => fp,
         Err(message) => {
@@ -624,6 +727,11 @@ fn push_candidate(
             return;
         }
     };
+    // Empty build and cache folders take no file space and should not crowd out
+    // the large findings the user needs to review.
+    if fp.bytes == 0 {
+        return;
+    }
     let age = now_secs().saturating_sub(fp.modified_secs);
     let process_reason = active_process_reason(policy, active_agents, &description);
     let guard_hint = description.clone();
@@ -675,6 +783,12 @@ fn push_candidate(
             "review",
             Some("This folder and all its contents will move to Trash. It may contain personal files. Review it carefully."),
         ),
+        Policy::Discovered | Policy::Worktree => (
+            true, true, "review", Some("Review this discovered location and its contents before cleanup."),
+        ),
+        Policy::Sensitive => (
+            false, false, "protected", Some("This contains app state, backups, or model data. Inspect it in Finder or manage it in the owning app."),
+        ),
         Policy::ReadOnly => (
             true,
             true,
@@ -697,6 +811,12 @@ fn push_candidate(
         cleanable,
         requires_ack,
         reason: reason.map(str::to_string),
+        cleanup_kind: if policy == Policy::Worktree {
+            Some("git".into())
+        } else {
+            None
+        },
+        allocated_bytes: Some(fp.allocated_bytes),
     };
     snapshots.insert(
         id,
@@ -818,6 +938,13 @@ fn temporary_candidates(
 }
 
 fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), String> {
+    build_scan_mode(home, false)
+}
+
+fn build_scan_mode(
+    home: &Path,
+    deep: bool,
+) -> Result<(ScanReport, HashMap<String, Snapshot>), String> {
     let started = Instant::now();
     let active_processes = running_agent_names();
     let mut items = Vec::new();
@@ -828,6 +955,12 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
     let agent_limit_warning =
         "The agent session scan reached its safety limit. Some sessions may be missing.";
     let mut agent_budget = 0;
+    let mut temp_visited = 0;
+    let (deep_seconds, deep_entries) = if deep {
+        (DEEP_SCAN_SECONDS, DEEP_SCAN_VISITED)
+    } else {
+        (MAX_TEMP_SCAN_SECONDS, MAX_TEMP_VISITED)
+    };
 
     // Agent transcripts are the primary target, so scan them before broad cache folders.
     let session_roots = [
@@ -912,8 +1045,8 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
         let temp_paths =
             temporary_candidates(&temp_root, temp_started, &mut temp_budget, &mut warnings);
         for path in temp_paths {
-            if temp_started.elapsed() > Duration::from_secs(MAX_TEMP_SCAN_SECONDS)
-                || temp_budget >= MAX_TEMP_VISITED
+            if temp_started.elapsed() > Duration::from_secs(deep_seconds)
+                || temp_budget >= deep_entries
                 || items.len() >= MAX_SCAN_ITEMS
             {
                 note_scan_warning(
@@ -934,7 +1067,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                     "Temporary Jest output",
                 )
             };
-            push_candidate(
+            register_candidate(
                 "developer",
                 Policy::Temporary,
                 path,
@@ -946,31 +1079,33 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                 &mut items,
                 &mut snapshots,
                 &mut warnings,
+                deep_seconds,
+                deep_entries,
             );
         }
-        if temp_started.elapsed() > Duration::from_secs(MAX_TEMP_SCAN_SECONDS)
-            || temp_budget >= MAX_TEMP_VISITED
+        if temp_started.elapsed() > Duration::from_secs(deep_seconds) || temp_budget >= deep_entries
         {
             note_scan_warning(
                 &mut warnings,
                 "Temporary cache scan reached its limit. Some cdk.out or jest_ folders may be missing.",
             );
         }
-        budget = budget.saturating_add(temp_budget);
+        temp_visited = temp_budget;
     }
 
+    let cache_started = Instant::now();
     let derived_data = home.join("Library/Developer/Xcode/DerivedData");
     if no_symlink_path(&derived_data, home) {
         for entry in read_entries(
             &derived_data,
-            started,
+            cache_started,
             &mut budget,
             &mut warnings,
             limit_warning,
             MAX_SCAN_SECONDS,
             MAX_VISITED,
         ) {
-            if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
+            if cache_started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
                 || budget >= MAX_VISITED
                 || items.len() >= MAX_SCAN_ITEMS
             {
@@ -986,7 +1121,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                     "Xcode build products that Xcode can recreate".into(),
                     "Xcode DerivedData".into(),
                     &active_processes,
-                    started,
+                    cache_started,
                     &mut budget,
                     &mut items,
                     &mut snapshots,
@@ -996,8 +1131,8 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
         }
     }
 
-    for (path, description) in cache_candidates(home, started, &mut budget, &mut warnings) {
-        if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
+    for (path, description) in cache_candidates(home, cache_started, &mut budget, &mut warnings) {
+        if cache_started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
             || budget >= MAX_VISITED
             || items.len() >= MAX_SCAN_ITEMS
         {
@@ -1012,7 +1147,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                 description,
                 "Application caches and logs".into(),
                 &active_processes,
-                started,
+                cache_started,
                 &mut budget,
                 &mut items,
                 &mut snapshots,
@@ -1025,14 +1160,14 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
     if no_symlink_path(&downloads, home) {
         for entry in read_entries(
             &downloads,
-            started,
+            cache_started,
             &mut budget,
             &mut warnings,
             limit_warning,
             MAX_SCAN_SECONDS,
             MAX_VISITED,
         ) {
-            if started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
+            if cache_started.elapsed() > Duration::from_secs(MAX_SCAN_SECONDS)
                 || budget >= MAX_VISITED
                 || items.len() >= MAX_SCAN_ITEMS
             {
@@ -1055,7 +1190,7 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
                     "Large download taking up space".into(),
                     "Downloads".into(),
                     &active_processes,
-                    started,
+                    cache_started,
                     &mut budget,
                     &mut items,
                     &mut snapshots,
@@ -1071,7 +1206,105 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
             "AI coding tools are open. Session history may be changing. Review files before clearing them.",
         );
     }
+    let found = discovery::discover(home, deep);
+    let detector_count = cache_roots(home).len() + 5 + found.detector_count;
+    for warning in found.warnings {
+        note_scan_warning(&mut warnings, &warning);
+    }
+    let extra_started = Instant::now();
+    let mut extra_budget = 0;
+    let mut candidates = found.candidates;
+    candidates.sort_by_key(|candidate| {
+        if candidate.source.starts_with("Git worktree") {
+            2
+        } else if candidate.handling == discovery::Handling::Sensitive {
+            0
+        } else if candidate.source.starts_with("Rust") || candidate.source.starts_with("QA") {
+            1
+        } else if candidate.handling == discovery::Handling::Developer {
+            3
+        } else {
+            4
+        }
+    });
+    let extra_seconds = if deep {
+        DEEP_SCAN_SECONDS
+    } else {
+        MAX_SCAN_SECONDS
+    };
+    let extra_entries = if deep { DEEP_SCAN_VISITED } else { MAX_VISITED };
+    for candidate in candidates {
+        if extra_started.elapsed() > Duration::from_secs(extra_seconds)
+            || extra_budget >= extra_entries
+            || items.len() >= MAX_SCAN_ITEMS
+        {
+            note_scan_warning(
+                &mut warnings,
+                "Additional discovery reached its measurement limit. Results are partial.",
+            );
+            break;
+        }
+        if snapshots.values().any(|snapshot| {
+            candidate.path == snapshot.path
+                || candidate.path.starts_with(&snapshot.path)
+                || snapshot.path.starts_with(&candidate.path)
+        }) {
+            continue;
+        }
+        let is_worktree = candidate.source.starts_with("Git worktree");
+        let policy = if is_worktree {
+            Policy::Worktree
+        } else {
+            match candidate.handling {
+                discovery::Handling::Sensitive => Policy::Sensitive,
+                discovery::Handling::Cache | discovery::Handling::Developer => Policy::Discovered,
+            }
+        };
+        if policy != Policy::Sensitive && !discovered_path_is_allowlisted(&candidate.path, home) {
+            continue;
+        }
+        let old_len = items.len();
+        register_candidate(
+            candidate.category,
+            policy,
+            candidate.path.clone(),
+            candidate.description,
+            candidate.source,
+            &active_processes,
+            extra_started,
+            &mut extra_budget,
+            &mut items,
+            &mut snapshots,
+            &mut warnings,
+            extra_seconds,
+            extra_entries,
+        );
+        if is_worktree && items.len() > old_len {
+            let reason = match worktrees::inspect(&candidate.path) {
+                Ok(info) => info.reason,
+                Err(error) => Some(error),
+            };
+            if let Some(reason) = reason {
+                if let Some(item) = items.last_mut() {
+                    item.cleanable = false;
+                    item.risk = "protected".into();
+                    item.reason = Some(reason);
+                    if let Some(snapshot) = snapshots.get_mut(&item.id) {
+                        snapshot.cleanable = false;
+                    }
+                }
+            } else if let Some(item) = items.last_mut() {
+                item.reason = Some("Git will remove this clean worktree and retain its branch. It will not go to Trash.".into());
+            }
+        }
+    }
     let report = ScanReport {
+        coverage: ScanCoverage {
+            mode: if deep { "deep" } else { "quick" }.into(),
+            detectors: detector_count,
+            visited_entries: budget + temp_visited + agent_budget + extra_budget,
+            elapsed_ms: started.elapsed().as_millis() as u64,
+        },
         id: format!(
             "scan-{}-{}",
             now_millis(),
@@ -1086,13 +1319,19 @@ fn build_scan(home: &Path) -> Result<(ScanReport, HashMap<String, Snapshot>), St
 }
 
 #[tauri::command(rename_all = "camelCase")]
-async fn scan_system(state: State<'_, AppState>) -> Result<ScanReport, String> {
+async fn scan_system(state: State<'_, AppState>, deep: Option<bool>) -> Result<ScanReport, String> {
     let state = state.inner().clone();
     let home =
         home_dir().ok_or_else(|| "Could not find the current user's home folder.".to_string())?;
-    let (report, entries) = tauri::async_runtime::spawn_blocking(move || build_scan(&home))
-        .await
-        .map_err(|_| "The storage scan could not finish.".to_string())??;
+    let (report, entries) = tauri::async_runtime::spawn_blocking(move || {
+        if deep.unwrap_or(false) {
+            build_scan_mode(&home, true)
+        } else {
+            build_scan(&home)
+        }
+    })
+    .await
+    .map_err(|_| "The storage scan could not finish.".to_string())??;
     let mut registry = lock_registry(&state);
     registry.scan_id = report.id.clone();
     registry.entries = entries;
@@ -1126,6 +1365,9 @@ async fn pick_cleanup_folder(
         home_dir().ok_or_else(|| "Could not find the current user's home folder.".to_string())?;
     let path = fs::canonicalize(&selected_path)
         .map_err(|error| format!("Could not resolve the selected folder: {error}"))?;
+    if worktrees::contains_repository(&path) {
+        return Err("This folder contains a Git repository. Use Deep scan for linked worktrees, or choose a build-cache subfolder.".into());
+    }
     if !manual_path_is_allowlisted(&path, &home) {
         return Err("Choose a folder inside your home folder or user temporary folder. Protected folders cannot be selected.".into());
     }
@@ -1170,6 +1412,8 @@ async fn pick_cleanup_folder(
         file_count: fingerprint.file_count,
         modified_at: fingerprint.modified_secs.saturating_mul(1000),
         description: "This folder and all its contents will move to Trash. It may contain personal files. Review it carefully.".into(),
+        cleanup_kind: None,
+        allocated_bytes: Some(fingerprint.allocated_bytes),
         source: "Added by you".into(),
         risk: "review".into(),
         cleanable: true,
@@ -1205,8 +1449,27 @@ async fn pick_cleanup_folder(
     Ok(Some(item))
 }
 
+fn discovered_path_is_allowlisted(path: &Path, home: &Path) -> bool {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if discovery::is_excluded(path, home) || meta.file_type().is_symlink() {
+        return false;
+    }
+    if meta.is_dir() {
+        return manual_path_is_allowlisted(path, home);
+    }
+    meta.is_file()
+        && path
+            .parent()
+            .is_some_and(|parent| manual_path_is_allowlisted(parent, home))
+}
+
 fn policy_root_allows(path: &Path, home: &Path, policy: Policy) -> bool {
     match policy {
+        Policy::Discovered => discovered_path_is_allowlisted(path, home),
+        Policy::Sensitive => false,
+        Policy::Worktree => path.starts_with(home) && path.join(".git").is_file(),
         Policy::Cache => cache_roots(home).iter().any(|(root, _)| {
             let Ok(relative) = path.strip_prefix(root) else {
                 return false;
@@ -1276,7 +1539,7 @@ fn is_old_enough(policy: Policy, age_secs: u64) -> bool {
         Policy::Developer => age_secs >= CACHE_MIN_AGE,
         Policy::Temporary => false,
         Policy::Manual => false,
-        Policy::ReadOnly => false,
+        Policy::ReadOnly | Policy::Discovered | Policy::Sensitive | Policy::Worktree => false,
     }
 }
 
@@ -1370,7 +1633,7 @@ fn cleanup_selected(
     if unique_ids.is_empty() || unique_ids.len() > MAX_TRASH_SELECTION {
         result.failures.push(CleanupFailure {
             id: String::new(),
-            message: "Choose between 1 and 200 items.".into(),
+            message: "Choose between 1 and 5,000 items.".into(),
         });
         return result;
     }
@@ -1414,6 +1677,25 @@ fn cleanup_selected(
             });
             continue;
         };
+        if snapshot.policy == Policy::Worktree {
+            let removed = if !acknowledge_risk {
+                Err("Confirm the Git worktree removal warning first.".into())
+            } else if !snapshot.cleanable || !policy_allows(&snapshot.path, home, snapshot.policy) {
+                Err("This worktree is protected or no longer available.".into())
+            } else {
+                worktrees::remove(&snapshot.path)
+            };
+            match removed {
+                Ok(()) => {
+                    result.trashed_ids.push(id);
+                    result.reclaimed_bytes = result
+                        .reclaimed_bytes
+                        .saturating_add(snapshot.fingerprint.bytes);
+                }
+                Err(message) => result.failures.push(CleanupFailure { id, message }),
+            }
+            continue;
+        }
         let active_reason =
             active_process_reason(snapshot.policy, &active_processes, &snapshot.guard_hint);
         let failure = if !snapshot.cleanable {
@@ -1498,7 +1780,9 @@ async fn trash_items(
     scan_id: String,
     item_ids: Vec<String>,
     acknowledge_risk: Option<bool>,
-) -> Result<CleanupResult, String> {
+) -> Result<CleanupReport, String> {
+    let home = home_dir().ok_or("Could not find the current user's home folder.")?;
+    let before = volume_info(&home).ok().map(|volume| volume.free_bytes);
     let (scan, selected) = {
         let registry = lock_registry(&state);
         (
@@ -1515,33 +1799,51 @@ async fn trash_items(
                 .collect::<Vec<_>>(),
         )
     };
-    if scan_id != scan {
-        return Ok(CleanupResult {
+    let result = if scan_id != scan {
+        CleanupResult {
             trashed_ids: Vec::new(),
             reclaimed_bytes: 0,
             failures: vec![CleanupFailure {
                 id: String::new(),
                 message: "This scan has expired. Scan again before cleaning.".into(),
             }],
-        });
-    }
-    let Some(home) = home_dir() else {
-        return Ok(CleanupResult {
-            trashed_ids: Vec::new(),
-            reclaimed_bytes: 0,
-            failures: vec![CleanupFailure {
-                id: String::new(),
-                message: "Could not find the current user's home folder.".into(),
-            }],
-        });
+        }
+    } else {
+        let worker_home = home.clone();
+        tauri::async_runtime::spawn_blocking(move || {
+            cleanup_selected(
+                &worker_home,
+                item_ids,
+                selected,
+                acknowledge_risk.unwrap_or(false),
+            )
+        })
+        .await
+        .map_err(|error| format!("The cleanup could not finish: {error}"))?
     };
-    let acknowledge_risk = acknowledge_risk.unwrap_or(false);
-    let result = tauri::async_runtime::spawn_blocking(move || {
-        cleanup_selected(&home, item_ids, selected, acknowledge_risk)
+    let after = volume_info(&home).ok().map(|volume| volume.free_bytes);
+    let mut registry = lock_registry(&state);
+    let moved_bytes = result.trashed_ids.iter().fold(0_u64, |total, id| {
+        total.saturating_add(
+            registry
+                .entries
+                .get(id)
+                .filter(|snapshot| snapshot.policy != Policy::Worktree)
+                .map_or(0, |snapshot| snapshot.fingerprint.bytes),
+        )
+    });
+    if registry.scan_id == scan_id {
+        for id in &result.trashed_ids {
+            registry.entries.remove(id);
+            registry.items.remove(id);
+        }
+    }
+    Ok(CleanupReport {
+        moved_bytes,
+        result,
+        free_bytes_before: before,
+        free_bytes_after: after,
     })
-    .await
-    .map_err(|_| "The cleanup could not finish.".to_string())?;
-    Ok(result)
 }
 
 #[tauri::command(rename_all = "camelCase")]
@@ -1559,8 +1861,17 @@ fn reveal_item(state: State<'_, AppState>, scan_id: String, item_id: String) -> 
     };
     let home =
         home_dir().ok_or_else(|| "Could not find the current user's home folder.".to_string())?;
-    if !policy_allows(&snapshot.path, &home, snapshot.policy) {
-        return Err("This location is outside the scan's safe paths.".into());
+    let allowed = if snapshot.policy == Policy::Sensitive {
+        fs::symlink_metadata(&snapshot.path).is_ok_and(|meta| {
+            !meta.file_type().is_symlink()
+                && metadata_identity(&meta)
+                    == (snapshot.fingerprint.root_dev, snapshot.fingerprint.root_ino)
+        })
+    } else {
+        policy_allows(&snapshot.path, &home, snapshot.policy)
+    };
+    if !allowed {
+        return Err("This location is outside the scan's safe paths or has changed.".into());
     }
     #[cfg(target_os = "macos")]
     {
@@ -1577,11 +1888,46 @@ fn reveal_item(state: State<'_, AppState>, scan_id: String, item_id: String) -> 
     }
 }
 
+#[tauri::command]
+async fn get_system_insights() -> Result<insights::SystemInsights, String> {
+    let home = home_dir().ok_or("Could not find your home folder.")?;
+    tauri::async_runtime::spawn_blocking(move || insights::collect(&home))
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command(rename_all = "camelCase")]
+fn open_system_settings(section: String) -> Result<(), String> {
+    let target = match section.as_str() {
+        "storage" => "x-apple.systempreferences:com.apple.settings.Storage",
+        "diskUtility" => "/System/Applications/Utilities/Disk Utility.app",
+        "docker" => "/Applications/Docker.app",
+        "timeMachine" => "x-apple.systempreferences:com.apple.Time-Machine-Settings.extension",
+        "loginItems" => "x-apple.systempreferences:com.apple.LoginItems-Settings.extension",
+        "trash" => {
+            let home = home_dir().ok_or("Could not find your home folder.")?;
+            return std::process::Command::new("/usr/bin/open")
+                .arg(home.join(".Trash"))
+                .spawn()
+                .map(|_| ())
+                .map_err(|e| e.to_string());
+        }
+        _ => return Err("Unknown settings section.".into()),
+    };
+    std::process::Command::new("/usr/bin/open")
+        .arg(target)
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 pub fn run() {
     tauri::Builder::default()
         .manage(AppState::default())
         .invoke_handler(tauri::generate_handler![
             scan_system,
+            get_system_insights,
+            open_system_settings,
             pick_cleanup_folder,
             trash_items,
             reveal_item
@@ -2099,6 +2445,36 @@ mod tests {
     }
 
     #[test]
+    fn hard_linked_build_files_are_counted_once() -> Result<(), Box<dyn std::error::Error>> {
+        let tmp = TempDir::new()?;
+        let original = tmp.path().join("artifact");
+        fs::write(&original, "build")?;
+        fs::hard_link(&original, tmp.path().join("linked-artifact"))?;
+        let measured = fingerprint(tmp.path()).map_err(std::io::Error::other)?;
+        assert_eq!(measured.bytes, 5);
+        assert_eq!(measured.file_count, 2);
+        assert_eq!(
+            measured.allocated_bytes,
+            allocated_size(&fs::metadata(original)?)
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads one explicitly chosen folder for storage accounting verification"]
+    fn native_folder_accounting() -> Result<(), Box<dyn std::error::Error>> {
+        let path = PathBuf::from(
+            std::env::var_os("CLEAN_MY_MAC_MEASURE_PATH").ok_or("Set CLEAN_MY_MAC_MEASURE_PATH")?,
+        );
+        let measured = fingerprint(&path).map_err(std::io::Error::other)?;
+        println!(
+            "Folder accounting: logical={}, allocated={}, files={}",
+            measured.bytes, measured.allocated_bytes, measured.file_count
+        );
+        Ok(())
+    }
+
+    #[test]
     #[ignore = "reads the current user's home; run explicitly for native smoke"]
     fn native_home_scan_smoke_reports_counts_without_paths()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2122,6 +2498,33 @@ mod tests {
             counts.get("developer").copied().unwrap_or(0),
             counts.get("large").copied().unwrap_or(0),
             report.warnings.len()
+        );
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "reads current home metadata; run explicitly for deep scan verification"]
+    fn native_deep_scan_report() -> Result<(), Box<dyn std::error::Error>> {
+        let home = home_dir().ok_or("Home folder is unavailable")?;
+        let (report, _) = build_scan_mode(&home, true).map_err(std::io::Error::other)?;
+        assert!(report.volume.total_bytes > 0);
+        assert_eq!(report.coverage.mode, "deep");
+        assert!(report.items.iter().any(|item| item.category != "agents"));
+        if let Some(output) = std::env::var_os("CLEAN_MY_MAC_SCAN_REPORT") {
+            fs::write(output, serde_json::to_vec_pretty(&report)?)?;
+        }
+        let system = insights::collect(&home);
+        if let Some(output) = std::env::var_os("CLEAN_MY_MAC_INSIGHTS_REPORT") {
+            fs::write(output, serde_json::to_vec_pretty(&system)?)?;
+        }
+        println!(
+            "Deep scan: {} findings, {} warnings, {} visited entries, {} ms; {} snapshots, {} launch agents",
+            report.items.len(),
+            report.warnings.len(),
+            report.coverage.visited_entries,
+            report.coverage.elapsed_ms,
+            system.snapshots.len(),
+            system.launch_agents.len()
         );
         Ok(())
     }

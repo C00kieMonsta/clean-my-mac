@@ -15,7 +15,7 @@ export async function systemInsights(): Promise<SystemInsights> {
   return invoke<SystemInsights>("get_system_insights");
 }
 
-export async function openSystemSettings(section: "storage" | "timeMachine" | "loginItems"): Promise<void> {
+export async function openSystemSettings(section: "storage" | "timeMachine" | "loginItems" | "diskUtility" | "trash" | "docker"): Promise<void> {
   if (previewMode) throw new Error("System Settings links are available in the Mac app.");
   return invoke<void>("open_system_settings", { section });
 }

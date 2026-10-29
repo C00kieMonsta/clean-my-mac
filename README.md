@@ -1,10 +1,32 @@
 # Clean My Mac
 
-Clean My Mac is a native macOS storage cleaner built with Tauri 2, Rust, React 19, TypeScript, Vite, and pnpm. It helps people find old agent sessions and other replaceable local clutter, then review each item before moving it to the Mac's Trash.
+Clean My Mac is a native macOS storage inspector and cleaner built with Tauri 2, Rust, React 19, TypeScript, Vite, and pnpm. It searches for replaceable clutter, unusual storage consumers, and old Git worktrees. You choose what to keep or clean.
 
-The scan runs locally. It does not upload file names or contents, and the app has no analytics. Settings and credentials are not scanned. Older inactive caches can be recommended. Recent or in-use histories and caches, plus files directly in Downloads, can be selected after an explicit risk acknowledgement. Nothing is removed during a scan.
+Scans run locally. The app does not upload file names, paths, or contents, and it has no analytics or account service. It does not read file contents to calculate sizes. It skips symbolic links. Nothing is removed during a scan.
 
-The storage view shows a volume summary and grouped findings, with clear sizes and reasons for each suggestion. Selected items move to Trash only after the user confirms. After cleanup, an in-app receipt lists original paths until the app closes or another cleanup runs. To restore a file, drag it from Trash to its original folder. Finder's Put Back option may be unavailable.
+## Finding clutter
+
+Quick scan checks known coding-agent transcripts, named application and developer caches, selected temporary build output, Xcode DerivedData, and large files directly in Downloads. It also reports selected model and app data as read-only findings. Deep scan adds bounded discovery under common project folders such as `Developer`, `Projects`, `Code`, and `src`. It looks for known build artifacts, dependency folders, and Git-linked worktrees. It can find more locations, but it does not search every disk path.
+
+The scan has independent safety limits. Agent history is limited to 5 seconds, 30,000 visited entries, and 1,500 findings. Quick scans limit temporary output to 10 seconds and 200,000 entries. Deep scans allow 60 seconds and 3,000,000 entries for this stage. Other scan stages use 30-second and 500,000-entry limits, with up to 5,000 findings. Deep discovery has its own 20-second, 50,000-entry, depth-7, and 2,500-candidate limits. Additional measurement allows 30 seconds and 500,000 entries in quick scans, or 60 seconds and 3,000,000 entries in deep scans. The app reports when a scan reaches a limit, so results may be partial.
+
+Some findings are intentionally read-only because they may contain valuable or required data. Examples include local model downloads, Android SDKs and virtual devices, iPhone backups, Xcode archives and device logs, Cursor application databases, Docker's virtual machine disk, and some project build output. These findings help explain disk use. They cannot be selected for deletion by Clean My Mac.
+
+The System insights view separately reports local snapshots, top memory-using processes, launch services with missing executable paths, and deleted files still held open by processes. These are context only. The app does not delete snapshots, unload services, or stop processes. Buttons open the relevant macOS Storage, Time Machine, and Login Items settings.
+
+## Reviewing and cleaning
+
+Each finding shows its path, size, age or reason where available, and cleanup risk. You can select individual findings. Recent or active histories and caches, model caches, personal Downloads files, and manually selected folders require a risk acknowledgement. Sensitive app data and protected worktrees remain read-only.
+
+Ordinary files are moved to the macOS Trash after you review and confirm. They continue to use disk space until the Trash is emptied. A changed path, unsafe link, path outside the cleanup allowlist, or item that cannot safely be moved is rejected.
+
+Clean, inactive Git worktrees can be removed through `git worktree remove`. This keeps their branches. Git is never invoked with `--force`. Worktrees with uncommitted or untracked changes, unrecognized ignored local files, a detached or locked state, or an active process are protected. Git removes worktree files directly. They do not go to Trash and cannot be restored from the app's receipt.
+
+The cleanup receipt lists only items successfully moved or removed by the latest completed cleanup response. It stays in memory while the app is open. A later completed cleanup replaces it, and quitting the app clears it. The receipt is not saved to disk. For Trash items, it shows their original paths so you can restore them manually. Finder's Put Back option may not be available.
+
+## Storage numbers
+
+The overview distinguishes immediately free space from space macOS reports as available for important use. The difference is shown as potentially reclaimable space. macOS decides when to reclaim purgeable space. This estimate is not a measurement of snapshot sizes or a guarantee of space Clean My Mac can free. Local snapshots are listed for information only.
 
 ## Run it
 
@@ -15,15 +37,13 @@ pnpm install --frozen-lockfile
 pnpm desktop
 ```
 
-Build the frontend with `pnpm build`. Run the project checks with `pnpm typecheck` and `pnpm test`. Build and open the local Mac app with `pnpm desktop:app`. Build an app bundle or disk image with `pnpm desktop:build`.
+Build the frontend with `pnpm build`. Run project checks with `pnpm typecheck` and `pnpm test`. Build and open the local Mac app with `pnpm desktop:app`. Build an app bundle or disk image with `pnpm desktop:build`.
 
 See [the build and release guide](docs/RELEASE.md) for local builds and download packaging.
 
 ## Privacy and safety
 
-Automatic scans read only known user-owned folders. You can also add a folder manually. The selected folder is reviewed as one item, and all its contents move to Trash if you confirm. The scanner follows neither symbolic links nor aliases. A changed path, symbolic link, or path outside an approved root is rejected before cleanup. See [the privacy and cleanup model](docs/PRIVACY.md) for details.
-
-Clean My Mac does not request administrator access, use `sudo`, or erase files directly. It asks macOS to move confirmed items to Trash. It does not clean operating system folders or scan the whole disk. These limits keep the app's recommendations understandable and protect personal data.
+Cleanup scans inspect known locations under your home folder. You can also choose a folder manually. A manually chosen folder is reviewed as one item, and all its contents move to Trash if you confirm. The scanner does not follow symbolic links. Clean My Mac does not request administrator access, use `sudo`, or erase files directly. It does not scan the whole disk or clean operating system folders. See [the privacy and cleanup model](docs/PRIVACY.md) for details.
 
 ## Downloading
 
